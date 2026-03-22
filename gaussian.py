@@ -44,12 +44,12 @@ def build_covariance_matrix(s, q):
 # ==================== 第1步：构建测试数据 (3D) ====================
 print("Step 1: Generating 3D test data (simulating SH coefficients at probe positions)...")
 
-def create_test_signal_3d(grid_size=32, num_channels=9):
+def create_test_signal_3d(grid_size=32, num_channels=3):
     """
-    创建3D模拟光探针球谐（SH）系数的测试信号。
+    创建3D模拟光探针的测试信号（RGB 3通道）。
     中等频率设计，目标PSNR 45-50dB。
-    用9通道模拟2阶球谐系数(L=0,1,2共计9个系数)。
-    返回: 信号 [D, H, W, 9]，模拟SH系数
+    与MBD_Control.py和MBD.py使用相同的测试信号以便对照。
+    返回: 信号 [D, H, W, 3]
     """
     x = torch.linspace(-1, 1, grid_size)
     y = torch.linspace(-1, 1, grid_size)
@@ -59,36 +59,18 @@ def create_test_signal_3d(grid_size=32, num_channels=9):
     
     signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
     
-    # === L=0 (1个系数): 环境光 + 软阴影 ===
+    # === Red Channel: 环境光 + 软阴影 ===
     signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
     signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
     signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
     
-    # === L=1 (3个系数): 方向性光照 ===
+    # === Green Channel: 方向性光照 ===
     signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
     signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
     
-    signal[..., 2] = 0.5 + 0.18 * Y * torch.cos(1.2 * np.pi * Z)
-    signal[..., 2] += 0.08 * torch.sin(1.6 * np.pi * Y) * torch.sin(1.4 * np.pi * X)
-    
-    signal[..., 3] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
-    signal[..., 3] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-    
-    # === L=2 (5个系数): 二阶球谐，中频细节 ===
-    signal[..., 4] = 0.5 + 0.12 * (X**2 - Y**2) * torch.cos(1.5 * np.pi * R)
-    signal[..., 4] += 0.06 * torch.sin(2.2 * np.pi * X) * torch.cos(1.8 * np.pi * Y)
-    
-    signal[..., 5] = 0.5 + 0.12 * X * Y * torch.sin(1.2 * np.pi * R)
-    signal[..., 5] += 0.06 * torch.sin(2.0 * np.pi * Y) * torch.cos(1.6 * np.pi * Z)
-    
-    signal[..., 6] = 0.5 + 0.1 * (2*Z**2 - X**2 - Y**2) * torch.cos(1.0 * np.pi * X)
-    signal[..., 6] += 0.06 * torch.sin(1.8 * np.pi * Z) * torch.sin(1.5 * np.pi * (X + Y))
-    
-    signal[..., 7] = 0.5 + 0.1 * X * Z * torch.sin(1.5 * np.pi * Y)
-    signal[..., 7] += 0.05 * torch.sin(2.0 * np.pi * X) * torch.cos(1.8 * np.pi * Z)
-    
-    signal[..., 8] = 0.5 + 0.1 * Y * Z * torch.sin(1.2 * np.pi * X)
-    signal[..., 8] += 0.05 * torch.sin(1.8 * np.pi * Y) * torch.cos(1.5 * np.pi * Z)
+    # === Blue Channel: 天空渐变 ===
+    signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
+    signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
     
     # 将信号值限制在合理范围
     for c in range(num_channels):
@@ -357,17 +339,18 @@ class GaussianCompressionSolver3D:
         
         return losses
 
-# 创建3D高斯压缩模型
-num_gaussians = 256  # 高斯数量
+# ==================== 对照组4: 3D高斯+MLP（带解码器的高斯模型） ====================
+# 与 gaussian_control.py (纯高斯) 对比，验证MLP解码器的效果
+num_gaussians = 128  # 高斯数量（与gaussian_control统一）
 model = GaussianProbeCompressor3D(
     num_gaussians=num_gaussians,
-    latent_dim=12,    # 潜在特征维度
-    sh_dim=9,         # 2阶球谐系数维度
+    latent_dim=8,     # 潜在特征维度
+    sh_dim=3,         # RGB 3通道（与其他对照组统一）
     mlp_hidden=32     # MLP隐藏层
 )
 # 3D高斯参数: 位置(3) + 尺度(3) + 四元数(4) + 潜在特征(D)
 
-# 计算压缩比 (9通道SH系数)
+# 计算压缩比
 original_size_bytes = probe_positions.shape[0] * C * 4  # N * C * sizeof(float32)
 comp_ratio, comp_size = model.get_compression_ratio(original_size_bytes)
 print(f"Original data size: {original_size_bytes/1024:.1f} KB")
@@ -375,9 +358,9 @@ print(f"Compressed model size: ~{comp_size/1024:.1f} KB")
 print(f"Estimated compression ratio: {comp_ratio:.1f}:1")
 print(f"Number of Gaussians: {model.K}")
 
-# 训练模型
-solver = GaussianCompressionSolver3D(model, lambda_reg=1e-7)
-losses = solver.train(probe_positions, probe_SH_data, epochs_main=2500, epochs_quant_finetune=500, batch_size=4096)
+# 训练模型（统一训练参数：总epochs=1500, batch_size=4096）
+solver = GaussianCompressionSolver3D(model, lambda_reg=1e-5)  # 与其他对照组统一正则化强度
+losses = solver.train(probe_positions, probe_SH_data, epochs_main=1000, epochs_quant_finetune=500, batch_size=4096)
 
 # ==================== 第3步：评估与可视化 ====================
 print("\nStep 3: Evaluating Gaussian Compression and Reconstruction...")
@@ -526,61 +509,53 @@ ax4.set_xlabel('X')
 ax4.set_ylabel('Y')
 ax4.set_zlabel('Z')
 
-# 5. 训练数据拟合度对比曲线 (选择Z中间切片的一条线)
+# 5. 训练损失曲线
 ax5 = plt.subplot(2, 4, 5)
-y_line = H // 2  # 选择Y方向中间位置的一条线
-channel_colors = ['#E74C3C', '#27AE60', '#3498DB', '#9B59B6', '#F39C12', '#1ABC9C', '#E67E22', '#8E44AD', '#2ECC71']
-channel_names = ['L0', 'L1-X', 'L1-Y', 'L1-Z', 'L2-0', 'L2-1', 'L2-2', 'L2-3', 'L2-4']
+total_losses = [l['total_loss'] for l in losses]
+mse_losses = [l['mse_loss'] for l in losses]
+ax5.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
+ax5.semilogy(mse_losses, 'g--', linewidth=1.5, alpha=0.7, label='MSE Loss')
+ax5.axvline(x=1200, color='r', linestyle=':', alpha=0.5, label='Quant Finetune Start')
+ax5.set_title('Training Loss (Log Scale)')
+ax5.set_xlabel('Iterations')
+ax5.set_ylabel('Loss')
+ax5.legend()
+ax5.grid(True, alpha=0.3)
 
-# 选取前3个通道展示 (L0和L1的两个分量)
-show_channels = [0, 1, 2]
-for c in show_channels:
-    ax5.plot(gt_slice[y_line, :, c], 
+# 6. 训练数据拟合度对比曲线
+ax6 = plt.subplot(2, 4, 6)
+y_line = H // 2
+channel_colors = ['#E74C3C', '#27AE60', '#3498DB']
+channel_names = ['R', 'G', 'B']
+
+for c in range(C):
+    ax6.plot(gt_slice[y_line, :, c], 
             color=channel_colors[c], linestyle='-', alpha=0.7, linewidth=1.5,
             label=f'Original {channel_names[c]}')
-    ax5.plot(rec_slice[y_line, :, c], 
+    ax6.plot(rec_slice[y_line, :, c], 
             color=channel_colors[c], linestyle='--', alpha=0.9, linewidth=1.5,
             label=f'Recon {channel_names[c]}')
 
-ax5.set_title(f'Training Data Fitting (Z={z_slice}, Y={y_line} slice)')
-ax5.set_xlabel('X Coordinate')
-ax5.set_ylabel('SH Coefficient Value')
-ax5.legend(loc='upper right', fontsize='x-small', ncol=2)
-ax5.grid(True, alpha=0.3)
+ax6.set_title(f'Fitting Comparison (Z={z_slice}, Y={y_line})')
+ax6.set_xlabel('X Coordinate')
+ax6.set_ylabel('Value')
+ax6.legend(loc='upper right', fontsize='x-small', ncol=2)
+ax6.grid(True, alpha=0.3)
 
-# 6. Rotation 可视化 (四元数分布)
-ax6 = plt.subplot(2, 4, 6)
+# 7. Rotation 可视化 (四元数分布)
+ax7 = plt.subplot(2, 4, 7)
 
 # 计算旋转角度 (从四元数转换为旋转角度)
 q_norm = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-8)
 rotation_angles = 2 * np.arccos(np.clip(q_norm[:, 0], -1, 1)) * 180 / np.pi  # 转换为角度
 
 # 绘制旋转角度的分布
-ax6.hist(rotation_angles, bins=30, alpha=0.7, color='purple', edgecolor='black')
-ax6.axvline(x=rotation_angles.mean(), color='red', linestyle='--', 
+ax7.hist(rotation_angles, bins=30, alpha=0.7, color='purple', edgecolor='black')
+ax7.axvline(x=rotation_angles.mean(), color='red', linestyle='--', 
             label=f'Mean: {rotation_angles.mean():.1f}°')
-ax6.set_title('Rotation Angle Distribution')
-ax6.set_xlabel('Rotation Angle (degrees)')
-ax6.set_ylabel('Count')
-ax6.legend()
-ax6.grid(True, alpha=0.3)
-
-# 添加统计信息
-rot_stats = f"Rotation Stats:\nMean: {rotation_angles.mean():.1f}°\nStd: {rotation_angles.std():.1f}°\nRange: [{rotation_angles.min():.1f}°, {rotation_angles.max():.1f}°]"
-ax6.text(0.98, 0.98, rot_stats, transform=ax6.transAxes, fontsize=8,
-         verticalalignment='top', horizontalalignment='right',
-         bbox=dict(boxstyle='round', facecolor='plum', alpha=0.5))
-
-# 7. 训练损失曲线
-ax7 = plt.subplot(2, 4, 7)
-total_losses = [l['total_loss'] for l in losses]
-mse_losses = [l['mse_loss'] for l in losses]
-ax7.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
-ax7.semilogy(mse_losses, 'g--', linewidth=1.5, alpha=0.7, label='MSE Loss')
-ax7.axvline(x=1500, color='r', linestyle=':', alpha=0.5, label='Quant Finetune Start')
-ax7.set_title('Training Loss Curves (Log Scale)')
-ax7.set_xlabel('Iterations')
-ax7.set_ylabel('Loss')
+ax7.set_title('Rotation Angle Distribution')
+ax7.set_xlabel('Rotation Angle (degrees)')
+ax7.set_ylabel('Count')
 ax7.legend()
 ax7.grid(True, alpha=0.3)
 
@@ -593,11 +568,11 @@ num_probes = D * H * W
 scale_ratios = s.max(axis=1) / (s.min(axis=1) + 1e-8)
 
 info_text = f"""
-3D Gaussian Compression Summary
-================================
+GAUSSIAN+MLP COMPRESSION SUMMARY
+==================================
 Original Data:
   Volume: {D}x{H}x{W} = {num_probes} probes
-  SH Dim: {C} (L=0,1,2 bands)
+  Data Dim: {C} (RGB)
   Size: {original_size_bytes/1024:.1f} KB
 
 Compressed Model:
@@ -610,26 +585,35 @@ Transform Statistics:
   Scale X: {s[:, 0].mean():.4f} ± {s[:, 0].std():.4f}
   Scale Y: {s[:, 1].mean():.4f} ± {s[:, 1].std():.4f}
   Scale Z: {s[:, 2].mean():.4f} ± {s[:, 2].std():.4f}
-  Anisotropy (max/min): {scale_ratios.mean():.2f} ± {scale_ratios.std():.2f}
-  Rotation Angle: {rotation_angles.mean():.1f}° ± {rotation_angles.std():.1f}°
+  Anisotropy: {scale_ratios.mean():.2f} ± {scale_ratios.std():.2f}
+  Rotation: {rotation_angles.mean():.1f}° ± {rotation_angles.std():.1f}°
 
 Reconstruction Quality:
   Avg PSNR: {avg_psnr:.1f} dB
   Avg SSIM: {avg_ssim:.4f}
   Final Loss: {losses[-1]['total_loss']:.6f}
 """
-ax8.text(0.05, 0.5, info_text, fontsize=8.5,
+ax8.text(0.05, 0.5, info_text, fontsize=9,
         family='monospace', verticalalignment='center')
 
-plt.suptitle('3D Gaussian Compression for Precomputed Indirect Illumination', fontsize=16, y=1.02)
+plt.suptitle('3D Gaussian + MLP Compression - Control Group 4 (with Decoder)', fontsize=16, y=1.02)
 plt.tight_layout()
+plt.savefig('output/3Dgaussian+MLP_1100+400epochs.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 print("\n" + "="*70)
-print("3D高斯压缩演示完成！关键结论：")
-print(f"1. 使用完整的3D高斯表示: 位置(3D) + 尺度(3D) + 旋转(四元数)")
-print(f"2. 使用 {model.K} 个高斯函数拟合了 {num_probes} 个探针的空间分布，压缩比约 {comp_ratio:.1f}:1")
-print(f"3. 重建质量：平均PSNR= {avg_psnr:.1f} dB, 平均SSIM={avg_ssim:.4f}")
-print(f"4. 协方差矩阵计算: Σ = R @ S @ S^T @ R^T（完整旋转支持）")
-print(f"5. 可视化展示了3D高斯分布位置、潜在特征图及重建误差")
+print("对照组4: 3D高斯+MLP压缩演示完成！")
+print("="*70)
+print(f"实验配置:")
+print(f"  - 模型类型: 3D Gaussian + MLP Decoder")
+print(f"  - 高斯数量: K={model.K}")
+print(f"  - 潜在特征维度: D={model.D}")
+print(f"  - 数据通道: {C} (RGB)")
+print(f"  - 训练轮数: 1500 epochs (1200+300 finetune)")
+print(f"关键结论:")
+print(f"  1. 使用完整的3D高斯表示: 位置(3D) + 尺度(3D) + 旋转(四元数)")
+print(f"  2. MLP解码器: latent({model.D}) + pos(3) -> RGB({C})")
+print(f"  3. 压缩比: {comp_ratio:.1f}:1")
+print(f"  4. 重建质量: PSNR={avg_psnr:.1f}dB, SSIM={avg_ssim:.4f}")
+print(f"  5. 协方差矩阵: Σ = R @ S @ S^T @ R^T（完整旋转支持）")
 print("="*70)
