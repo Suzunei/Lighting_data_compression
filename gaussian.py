@@ -277,9 +277,18 @@ class GaussianCompressionSolver3D:
         return total_loss, mse_loss, reg_loss
 
     def train_step(self, pos_batch, sh_batch, stage='main'):
-        """单次训练步骤"""
-        self.optimizer_gaussian.zero_grad()
-        self.optimizer_mlp.zero_grad()
+        """
+        单次训练步骤
+        stage='main': 训练所有参数（高斯+MLP）
+        stage='quant': 冻结高斯参数，只训练MLP（量化微调阶段）
+        """
+        if stage == 'quant':
+            # 量化阶段：只训练MLP，冻结高斯参数
+            self.optimizer_mlp.zero_grad()
+        else:
+            # 主训练阶段：训练所有参数
+            self.optimizer_gaussian.zero_grad()
+            self.optimizer_mlp.zero_grad()
         
         pred_SH, _, _ = self.model(pos_batch)
         total_loss, mse_loss, reg_loss = self.compute_loss(pred_SH, sh_batch)
@@ -287,10 +296,17 @@ class GaussianCompressionSolver3D:
         total_loss.backward()
         
         # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if stage == 'quant':
+            torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         
-        self.optimizer_gaussian.step()
-        self.optimizer_mlp.step()
+        # 参数更新
+        if stage == 'quant':
+            self.optimizer_mlp.step()
+        else:
+            self.optimizer_gaussian.step()
+            self.optimizer_mlp.step()
         
         return {
             'total_loss': total_loss.item(),
@@ -326,8 +342,9 @@ class GaussianCompressionSolver3D:
             if epoch % 100 == 0 or epoch == epochs_main - 1:
                 print(f"  Epoch {epoch:4d} | Loss: {loss_dict['total_loss']:.6f} | MSE: {loss_dict['mse_loss']:.6f}")
         
-        # 模拟量化阶段
+        # 量化微调阶段：冻结高斯参数，只训练MLP
         print(f"\nStarting QUANTIZATION-AWARE finetuning ({epochs_quant_finetune} epochs)...")
+        print(f"  [Freeze] Gaussian parameters frozen, only training MLP decoder")
         self.quantize_parameters(bits=10)
         for epoch in range(epochs_quant_finetune):
             indices = torch.randperm(num_samples)[:batch_size]
@@ -360,7 +377,7 @@ print(f"Number of Gaussians: {model.K}")
 
 # 训练模型（统一训练参数：总epochs=1500, batch_size=4096）
 solver = GaussianCompressionSolver3D(model, lambda_reg=1e-5)  # 与其他对照组统一正则化强度
-losses = solver.train(probe_positions, probe_SH_data, epochs_main=1000, epochs_quant_finetune=500, batch_size=4096)
+losses = solver.train(probe_positions, probe_SH_data, epochs_main=1400, epochs_quant_finetune=100, batch_size=4096)
 
 # ==================== 第3步：评估与可视化 ====================
 print("\nStep 3: Evaluating Gaussian Compression and Reconstruction...")
@@ -598,7 +615,7 @@ ax8.text(0.05, 0.5, info_text, fontsize=9,
 
 plt.suptitle('3D Gaussian + MLP Compression - Control Group 4 (with Decoder)', fontsize=16, y=1.02)
 plt.tight_layout()
-plt.savefig('output/3Dgaussian+MLP_1100+400epochs.png', dpi=150, bbox_inches='tight')
+plt.savefig('output/3Dgaussian+MLP_1400+100epochs.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 print("\n" + "="*70)
