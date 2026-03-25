@@ -5,6 +5,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d import Axes3D
+from test_signal_3d import get_test_signal_by_name, get_all_test_signals
 
 #运行指令：$env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 #python MBD_Control.py 2>&1
@@ -27,31 +28,31 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
     z = torch.linspace(-1, 1, grid_size)
     X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
     R = torch.sqrt(X**2 + Y**2 + Z**2 + 1e-8)
-    
+
     signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
-    
+
     # === Red Channel: 环境光 + 软阴影 ===
     signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
     signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
     signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
-    
+
     # === Green Channel: 方向性光照 ===
     signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
     signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
-    
+
     # === Blue Channel: 天空渐变 ===
     signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
     signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-    
+
     # 将信号值限制在合理范围
     for c in range(num_channels):
         signal[..., c] = torch.clamp(signal[..., c], 0.1, 0.9)
-    
+
     return signal
 
 # Generate 3D test signal
 grid_size = 32  # Smaller grid for 3D due to memory
-ground_truth = create_test_signal_3d(grid_size)
+ground_truth = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
@@ -73,7 +74,7 @@ class MBDCompressor3D(nn.Module):
         c_l(x) = Σ_m φ_m(x) * c_{m,l}
         b_l(x) = Σ_n ψ_n(x) * B_{n,l}
         f̂(x) = Σ_l c_l(x) * b_l(x)
-    
+
     This is a pure MBD baseline without Gaussian components (control group).
     """
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
@@ -161,7 +162,7 @@ class MBDCompressor3D(nn.Module):
         """Compute compression ratio"""
         # Original data size: D*H*W*C*4 bytes (float32)
         # Compressed: M*L*4 + N*L*data_dim*4 + M*spatial_dim*4 + N*spatial_dim*4 bytes
-        compressed_size = (self.M * self.L + self.N * self.L * self.data_dim + 
+        compressed_size = (self.M * self.L + self.N * self.L * self.data_dim +
                           self.M * self.spatial_dim + self.N * self.spatial_dim) * 4
         ratio = original_size / compressed_size
         return ratio, compressed_size

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from test_signal_3d import get_test_signal_by_name, get_all_test_signals
 
 #运行指令：$env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 #python MBD_Demo.py 2>&1
@@ -26,26 +27,26 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
     z = torch.linspace(-1, 1, grid_size)
     X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
     R = torch.sqrt(X**2 + Y**2 + Z**2 + 1e-8)
-    
+
     signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
-    
+
     # === Red Channel: 环境光 + 软阴影 ===
     signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
     signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
     signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
-    
+
     # === Green Channel: 方向性光照 ===
     signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
     signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
-    
+
     # === Blue Channel: 天空渐变 ===
     signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
     signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-    
+
     # 将信号值限制在合理范围
     for c in range(num_channels):
         signal[..., c] = torch.clamp(signal[..., c], 0.1, 0.9)
-    
+
     return signal
 
 # Generate 3D test signal
@@ -75,7 +76,7 @@ def quaternion_to_rotation_matrix(q):
     # Normalize quaternion
     q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-8)
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    
+
     # Build rotation matrix
     R = torch.stack([
         torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y], dim=-1),
@@ -92,7 +93,7 @@ class MBDCompressor(nn.Module):
         c_l(x) = Σ_m φ_m(x) * c_{m,l}
         b_l(x) = Σ_n ψ_n(x) * B_{n,l}
         f̂(x) = Σ_l c_l(x) * b_l(x)
-    
+
     Gaussian covariance: Σ = R @ S @ S^T @ R^T (full rotation support)
     """
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
@@ -106,23 +107,23 @@ class MBDCompressor(nn.Module):
         coeff_grid_size = int(np.ceil(coeff_res ** (1/3)))
         coeff_grid = self._create_jittered_grid(coeff_res, coeff_grid_size, jitter=0.15)
         self.coeff_points = nn.Parameter(coeff_grid)
-        
+
         # Basis control points: use stratified sampling
         basis_grid_size = int(np.ceil(basis_res ** (1/3)))
         basis_grid = self._create_jittered_grid(basis_res, basis_grid_size, jitter=0.12)
         self.basis_points = nn.Parameter(basis_grid)
-        
+
         # Trainable log-scale parameters with adaptive initialization
         # Smaller initial scales for coeff (more local), larger for basis (smoother)
         self.coeff_log_scales = nn.Parameter(
-            torch.full((coeff_res, 3), np.log(coeff_kernel_scale_init)) + 
+            torch.full((coeff_res, 3), np.log(coeff_kernel_scale_init)) +
             torch.randn(coeff_res, 3) * 0.1  # Add small variation
         )
         self.basis_log_scales = nn.Parameter(
             torch.full((basis_res, 3), np.log(basis_kernel_scale_init)) +
             torch.randn(basis_res, 3) * 0.1
         )
-        
+
         # Trainable quaternion rotation with small random perturbation
         self.coeff_q = nn.Parameter(torch.zeros(coeff_res, 4))
         self.basis_q = nn.Parameter(torch.zeros(basis_res, 4))
@@ -156,7 +157,7 @@ class MBDCompressor(nn.Module):
         coords_1d = torch.linspace(0.05, 0.95, grid_size)
         xx, yy, zz = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
         base_grid = torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=-1)
-        
+
         # Sample required number of points
         if len(base_grid) >= num_points:
             indices = torch.randperm(len(base_grid))[:num_points]
@@ -164,7 +165,7 @@ class MBDCompressor(nn.Module):
         else:
             # If need more points, use random sampling
             grid = torch.rand(num_points, 3) * 0.9 + 0.05
-        
+
         # Add jitter
         grid = grid + torch.randn_like(grid) * jitter / grid_size
         grid = torch.clamp(grid, 0.02, 0.98)  # Keep within bounds
@@ -174,36 +175,36 @@ class MBDCompressor(nn.Module):
         """
         Compute 3D Gaussian kernel weights with full covariance matrix.
         Uses Mahalanobis distance with Σ = R @ S @ S^T @ R^T
-        
+
         query_pts: [Q, 3] - query 3D positions
         control_pts: [K, 3] - control point 3D positions
         log_scales: [K, 3] - log of anisotropic scales (s_x, s_y, s_z)
         quaternions: [K, 4] - rotation quaternions (w, x, y, z)
-        
+
         Returns: [Q, K] normalized Gaussian weights
         """
         Q = query_pts.shape[0]
         K = control_pts.shape[0]
-        
+
         # Get actual scales from log-scales
         scales = torch.exp(log_scales)  # [K, 3]
-        
+
         # Build rotation matrices from quaternions
         R = quaternion_to_rotation_matrix(quaternions)  # [K, 3, 3]
-        
+
         # Build precision matrix (inverse covariance): Σ^{-1} = R @ S^{-2} @ R^T
         s_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # [K, 3]
         S_inv_sq = torch.diag_embed(s_inv_sq)  # [K, 3, 3]
         precision = R @ S_inv_sq @ R.transpose(-1, -2)  # [K, 3, 3]
-        
+
         # Compute Mahalanobis distance: (p - μ)^T @ Σ^{-1} @ (p - μ)
         diff = query_pts.unsqueeze(1) - control_pts.unsqueeze(0)  # [Q, K, 3]
         diff_expanded = diff.unsqueeze(-1)  # [Q, K, 3, 1]
         precision_expanded = precision.unsqueeze(0)  # [1, K, 3, 3]
-        
+
         mahalanobis_sq = (diff_expanded.transpose(-1, -2) @ precision_expanded @ diff_expanded)
         mahalanobis_sq = mahalanobis_sq.squeeze(-1).squeeze(-1)  # [Q, K]
-        
+
         # Gaussian kernel: exp(-0.5 * d_mahalanobis²)
         weights = torch.exp(-0.5 * mahalanobis_sq)
 
@@ -246,7 +247,7 @@ class MBDCompressor(nn.Module):
         compressed_size += (self.M * 10 + self.N * 10) * 4
         ratio = original_size / compressed_size
         return ratio, compressed_size
-    
+
     def get_gaussian_params(self):
         """Get Gaussian parameters for visualization"""
         with torch.no_grad():
@@ -254,7 +255,7 @@ class MBDCompressor(nn.Module):
             coeff_s = torch.exp(self.coeff_log_scales).cpu().numpy()
             coeff_q = self.coeff_q.cpu().numpy()
             coeff_q = coeff_q / (np.linalg.norm(coeff_q, axis=1, keepdims=True) + 1e-8)
-            
+
             basis_mu = self.basis_points.cpu().numpy()
             basis_s = torch.exp(self.basis_log_scales).cpu().numpy()
             basis_q = self.basis_q.cpu().numpy()
@@ -314,7 +315,7 @@ class MBDSolver:
         recon_loss = 0.8 * l2_loss + 0.2 * l1_loss  # Hybrid
 
         # Frobenius norm regularization (prevents scale ambiguity)
-        reg_loss = self.lambda_reg * (torch.sum(coeff_params ** 2) + 
+        reg_loss = self.lambda_reg * (torch.sum(coeff_params ** 2) +
                                        0.1 * torch.sum(self.model.B ** 2))
 
         # Total variation regularization
@@ -390,7 +391,7 @@ class MBDSolver:
         num_samples = coords.shape[0]
         best_loss = float('inf')
         best_state = None
-        
+
         # Exponential moving average for smoother loss monitoring
         ema_loss = None
         ema_alpha = 0.98
@@ -402,7 +403,7 @@ class MBDSolver:
             # Use larger batch in later stages for stability
             current_batch = min(batch_size, batch_size // 2 + (batch_size // 2) * epoch // (epochs // 2))
             current_batch = max(2048, current_batch)
-            
+
             # Random batch sampling
             indices = torch.randperm(num_samples)[:current_batch]
             coords_batch = coords[indices]
@@ -461,7 +462,7 @@ model = MBDCompressor(
 )
 
 solver = MBDSolver(
-    model, 
+    model,
     lambda_reg=0.003,      # Reduced regularization for better fitting
     lambda_tv=0.0008,      # TV regularization for smoothness
     lambda_smooth=0.0003   # Gaussian parameter smoothness
@@ -661,7 +662,7 @@ all_angles = np.concatenate([coeff_angles, basis_angles])
 
 ax7.hist(coeff_angles, bins=20, alpha=0.6, color='red', edgecolor='darkred', label='Coeff')
 ax7.hist(basis_angles, bins=20, alpha=0.6, color='blue', edgecolor='darkblue', label='Basis')
-ax7.axvline(x=all_angles.mean(), color='green', linestyle='--', 
+ax7.axvline(x=all_angles.mean(), color='green', linestyle='--',
             label=f'Mean: {all_angles.mean():.1f}\u00b0')
 ax7.set_title('Rotation Angle Distribution')
 ax7.set_xlabel('Rotation Angle (degrees)')

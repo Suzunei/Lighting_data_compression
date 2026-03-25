@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from test_signal_3d import get_test_signal_by_name, get_all_test_signals
 
 # 设置随机种子以确保可重复性
 torch.manual_seed(42)
@@ -18,7 +19,7 @@ def quaternion_to_rotation_matrix(q):
     """
     q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-8)
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    
+
     R = torch.stack([
         torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y], dim=-1),
         torch.stack([2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x], dim=-1),
@@ -41,26 +42,26 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
     z = torch.linspace(-1, 1, grid_size)
     X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
     R = torch.sqrt(X**2 + Y**2 + Z**2 + 1e-8)
-    
+
     signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
-    
+
     # === Red Channel: 环境光 + 软阴影 ===
     signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
     signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
     signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
-    
+
     # === Green Channel: 方向性光照 ===
     signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
     signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
-    
+
     # === Blue Channel: 天空渐变 ===
     signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
     signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-    
+
     # 将信号值限制在合理范围
     for c in range(num_channels):
         signal[..., c] = torch.clamp(signal[..., c], 0.1, 0.9)
-    
+
     return signal
 
 # 生成3D测试信号（与MBD_Control和MBD使用相同的RGB测试信号）
@@ -95,27 +96,27 @@ class GaussianOnlyCompressor3D(nn.Module):
         super().__init__()
         self.K = num_gaussians
         self.C = sh_dim
-        
+
         # ========== 3D高斯函数参数（可学习） ==========
         # 位置 mu: [K, 3] (3D位置)
         self.mu = nn.Parameter(torch.rand(num_gaussians, 3))
-        
+
         # 对数尺度 log_s: [K, 3] (使用对数确保为正)
         self.log_s = nn.Parameter(torch.randn(num_gaussians, 3) * 0.3 - 1.5)
-        
+
         # 四元数旋转 q: [K, 4] (w, x, y, z)
         self.q = nn.Parameter(torch.zeros(num_gaussians, 4))
         with torch.no_grad():
             self.q[:, 0] = 1.0
-        
+
         # SH系数 F: [K, C] - 每个高斯直接携带SH系数
         self.F = nn.Parameter(torch.randn(num_gaussians, sh_dim) * 0.1 + 0.5)
-        
+
         # 初始化高斯位置
         with torch.no_grad():
             indices = torch.randperm(probe_positions.shape[0])[:num_gaussians]
             self.mu.copy_(probe_positions[indices])
-        
+
         print(f"Gaussian-Only model initialized: K={num_gaussians} gaussians, SH dim={sh_dim}")
         print(f"  Transforms: Position(3D) + Scale(3D) + Rotation(Quaternion)")
         print(f"  NO MLP decoder - direct SH coefficient weighted interpolation")
@@ -129,13 +130,13 @@ class GaussianOnlyCompressor3D(nn.Module):
         s_inv_sq = 1.0 / (s_j ** 2 + 1e-8)  # [K, 3]
         S_inv_sq = torch.diag_embed(s_inv_sq)  # [K, 3, 3]
         precision = R @ S_inv_sq @ R.transpose(-1, -2)  # [K, 3, 3]
-        
+
         diff = p.unsqueeze(1) - mu_j.unsqueeze(0)  # [N, K, 3]
         diff_expanded = diff.unsqueeze(-1)  # [N, K, 3, 1]
         precision_expanded = precision.unsqueeze(0)  # [1, K, 3, 3]
-        
+
         mahalanobis_sq = (diff_expanded.transpose(-1, -2) @ precision_expanded @ diff_expanded).squeeze(-1).squeeze(-1)
-        
+
         return torch.exp(-0.5 * mahalanobis_sq)
 
     def compute_influence_radius(self, s_j):
@@ -146,25 +147,25 @@ class GaussianOnlyCompressor3D(nn.Module):
         """
         前向传播（无MLP，直接加权插值）。
         输入: probe_pos [N, 3] 3D探针位置
-        返回: 
+        返回:
             reconstructed_SH [N, C]: 重建的SH系数
             weights [N, K]: 高斯加权权重
         """
         s = torch.exp(self.log_s)
-        
+
         # 1. 计算每个3D高斯函数在探针位置的值
         gaussian_vals = self.gaussian_function_3d(probe_pos, self.mu, s, self.q)  # [N, K]
-        
+
         # 2. 计算影响半径掩码
         radii = self.compute_influence_radius(s)  # [K]
         dist = torch.norm(probe_pos.unsqueeze(1) - self.mu.unsqueeze(0), dim=2)  # [N, K]
         mask = dist < radii.unsqueeze(0)  # [N, K]
         gaussian_vals = gaussian_vals * mask.float()
-        
+
         # 3. 归一化加权并直接插值SH系数
         weights = gaussian_vals / (gaussian_vals.sum(dim=1, keepdim=True) + 1e-8)
         reconstructed_SH = torch.matmul(weights, self.F)  # [N, C]
-        
+
         return reconstructed_SH, weights
 
     def get_compression_ratio(self, original_size_bytes):
@@ -176,7 +177,7 @@ class GaussianOnlyCompressor3D(nn.Module):
         compressed_size_bytes = gaussian_params_size
         ratio = original_size_bytes / compressed_size_bytes
         return ratio, compressed_size_bytes
-    
+
     def get_gaussian_params(self):
         """获取高斯参数用于可视化"""
         with torch.no_grad():
@@ -192,7 +193,7 @@ class GaussianOnlySolver3D:
     def __init__(self, model, lambda_reg=1e-4):
         self.model = model
         self.lambda_reg = lambda_reg
-        
+
         gaussian_params = [self.model.mu, self.model.log_s, self.model.q, self.model.F]
         self.optimizer = optim.Adam(gaussian_params, lr=0.005)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=50, factor=0.5)
@@ -207,14 +208,14 @@ class GaussianOnlySolver3D:
     def train_step(self, pos_batch, sh_batch):
         """单次训练步骤"""
         self.optimizer.zero_grad()
-        
+
         pred_SH, _ = self.model(pos_batch)
         total_loss, mse_loss, reg_loss = self.compute_loss(pred_SH, sh_batch)
-        
+
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        
+
         return {
             'total_loss': total_loss.item(),
             'mse_loss': mse_loss.item(),
@@ -225,19 +226,19 @@ class GaussianOnlySolver3D:
         """训练循环"""
         num_samples = probe_pos.shape[0]
         losses = []
-        
+
         print(f"Starting Gaussian-Only training ({epochs} epochs)...")
         for epoch in range(epochs):
             indices = torch.randperm(num_samples)[:batch_size]
             pos_batch = probe_pos[indices]
             sh_batch = probe_sh[indices]
-            
+
             loss_dict = self.train_step(pos_batch, sh_batch)
             losses.append(loss_dict)
-            
+
             if epoch % 100 == 0 or epoch == epochs - 1:
                 print(f"  Epoch {epoch:4d} | Loss: {loss_dict['total_loss']:.6f} | MSE: {loss_dict['mse_loss']:.6f}")
-        
+
         return losses
 
 
@@ -346,7 +347,7 @@ plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 ax4 = fig.add_subplot(2, 4, 4, projection='3d')
 mu, s, q = model.get_gaussian_params()
 
-ax4.scatter(mu[:, 0], mu[:, 1], mu[:, 2], 
+ax4.scatter(mu[:, 0], mu[:, 1], mu[:, 2],
             c='black', s=20, alpha=0.8, label='Gaussian Centers')
 
 def draw_ellipsoid(ax, center, scale, quaternion, n_points=20, alpha=0.15, color='blue'):
@@ -356,28 +357,28 @@ def draw_ellipsoid(ax, center, scale, quaternion, n_points=20, alpha=0.15, color
     x = np.outer(np.cos(u), np.sin(v))
     y = np.outer(np.sin(u), np.sin(v))
     z = np.outer(np.ones(np.size(u)), np.cos(v))
-    
+
     x = x * scale[0]
     y = y * scale[1]
     z = z * scale[2]
-    
+
     q_norm = quaternion / (np.linalg.norm(quaternion) + 1e-8)
     w, x_q, y_q, z_q = q_norm
-    
+
     R = np.array([
         [1 - 2*y_q*y_q - 2*z_q*z_q, 2*x_q*y_q - 2*w*z_q, 2*x_q*z_q + 2*w*y_q],
         [2*x_q*y_q + 2*w*z_q, 1 - 2*x_q*x_q - 2*z_q*z_q, 2*y_q*z_q - 2*w*x_q],
         [2*x_q*z_q - 2*w*y_q, 2*y_q*z_q + 2*w*x_q, 1 - 2*x_q*x_q - 2*y_q*y_q]
     ])
-    
+
     points = np.array([x.flatten(), y.flatten(), z.flatten()])
     rotated_points = R @ points
-    
+
     x_rot = rotated_points[0, :].reshape(x.shape) + center[0]
     y_rot = rotated_points[1, :].reshape(y.shape) + center[1]
     z_rot = rotated_points[2, :].reshape(z.shape) + center[2]
-    
-    ax.plot_surface(x_rot, y_rot, z_rot, alpha=alpha, color=color, 
+
+    ax.plot_surface(x_rot, y_rot, z_rot, alpha=alpha, color=color,
                     linewidth=0, antialiased=True)
 
 # 绘制部分椭球
@@ -432,7 +433,7 @@ q_norm = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-8)
 rotation_angles = 2 * np.arccos(np.clip(q_norm[:, 0], -1, 1)) * 180 / np.pi
 
 ax7.hist(rotation_angles, bins=30, alpha=0.7, color='purple', edgecolor='black')
-ax7.axvline(x=rotation_angles.mean(), color='red', linestyle='--', 
+ax7.axvline(x=rotation_angles.mean(), color='red', linestyle='--',
             label=f'Mean: {rotation_angles.mean():.1f}°')
 ax7.set_title('Rotation Angle Distribution')
 ax7.set_xlabel('Rotation Angle (degrees)')

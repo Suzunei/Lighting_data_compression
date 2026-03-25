@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from test_signal_3d import get_test_signal_by_name, get_all_test_signals
 
 #运行指令：$env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 #python MBD.py 2>&1
@@ -22,7 +23,7 @@ def quaternion_to_rotation_matrix(q):
     # 归一化四元数
     q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-8)
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    
+
     # 构建旋转矩阵
     R = torch.stack([
         torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y], dim=-1),
@@ -45,26 +46,26 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
     z = torch.linspace(-1, 1, grid_size)
     X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
     R = torch.sqrt(X**2 + Y**2 + Z**2 + 1e-8)
-    
+
     signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
-    
+
     # === Red Channel: 环境光 + 软阴影 ===
     signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
     signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
     signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
-    
+
     # === Green Channel: 方向性光照 ===
     signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
     signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
-    
+
     # === Blue Channel: 天空渐变 ===
     signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
     signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-    
+
     # 将信号值限制在合理范围
     for c in range(num_channels):
         signal[..., c] = torch.clamp(signal[..., c], 0.1, 0.9)
-    
+
     return signal
 
 # Generate 3D test signal
@@ -91,7 +92,7 @@ class MBDCompressor3D(nn.Module):
         c_l(x) = Σ_m φ_m(x) * c_{m,l}
         b_l(x) = Σ_n ψ_n(x) * B_{n,l}
         f̂(x) = Σ_l c_l(x) * b_l(x)
-    
+
     基于3DGS论文实现完整的3D高斯表示，包含位置、尺度、旋转（四元数）。
     """
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
@@ -112,7 +113,7 @@ class MBDCompressor3D(nn.Module):
         self.coeff_q = nn.Parameter(torch.zeros(coeff_res, 4))
         with torch.no_grad():
             self.coeff_q[:, 0] = 1.0  # 初始化为单位四元数 [1, 0, 0, 0]
-        
+
         # ========== Basis 3D Gaussian Parameters ==========
         # 位置 mu: [N, 3]
         self.basis_mu = nn.Parameter(torch.rand(basis_res, 3))
@@ -145,7 +146,7 @@ class MBDCompressor3D(nn.Module):
         """
         计算位置p处的完整协方差3D高斯函数值。
         使用完整的协方差矩阵 Σ = R @ S @ S^T @ R^T
-        
+
         p: [N, 3] 查询位置
         mu: [K, 3] 高斯中心
         s: [K, 3] 尺度
@@ -153,30 +154,30 @@ class MBDCompressor3D(nn.Module):
         返回: [N, K] 高斯函数值
         """
         K = mu.shape[0]
-        
+
         # 构建协方差矩阵的逆 (precision matrix)
         # Σ^{-1} = R @ S^{-2} @ R^T
         R = quaternion_to_rotation_matrix(q)  # [K, 3, 3]
         s_inv_sq = 1.0 / (s ** 2 + 1e-8)  # [K, 3]
         S_inv_sq = torch.diag_embed(s_inv_sq)  # [K, 3, 3]
         precision = R @ S_inv_sq @ R.transpose(-1, -2)  # [K, 3, 3] 精度矩阵
-        
+
         # 计算马氏距离平方: (p - mu)^T @ Σ^{-1} @ (p - mu)
         diff = p.unsqueeze(1) - mu.unsqueeze(0)  # [N, K, 3]
-        
+
         # 批量计算: diff @ precision @ diff^T
         diff_expanded = diff.unsqueeze(-1)  # [N, K, 3, 1]
         precision_expanded = precision.unsqueeze(0)  # [1, K, 3, 3]
-        
+
         # (p-mu)^T @ Σ^{-1} @ (p-mu)
         mahalanobis_sq = (diff_expanded.transpose(-1, -2) @ precision_expanded @ diff_expanded).squeeze(-1).squeeze(-1)  # [N, K]
-        
+
         return torch.exp(-0.5 * mahalanobis_sq)
 
     def compute_gaussian_weights_3d(self, query_pts, mu, log_s, q):
         """
         计算3D高斯权重（归一化）。
-        
+
         query_pts: [Q, 3] - 查询位置
         mu: [K, 3] - 高斯中心位置
         log_s: [K, 3] - 对数尺度
@@ -185,7 +186,7 @@ class MBDCompressor3D(nn.Module):
         """
         s = torch.exp(log_s)  # [K, 3]
         gaussian_vals = self.gaussian_function_3d(query_pts, mu, s, q)  # [Q, K]
-        
+
         # 归一化权重
         weights = gaussian_vals / (gaussian_vals.sum(dim=1, keepdim=True) + 1e-8)
         return weights
@@ -222,7 +223,7 @@ class MBDCompressor3D(nn.Module):
         compressed_size = (coeff_params + basis_params) * 4
         ratio = original_size / compressed_size
         return ratio, compressed_size
-    
+
     def get_gaussian_params(self):
         """获取高斯参数用于可视化"""
         with torch.no_grad():
@@ -230,7 +231,7 @@ class MBDCompressor3D(nn.Module):
             coeff_s = torch.exp(self.coeff_log_s).cpu().numpy()
             coeff_q = self.coeff_q.cpu().numpy()
             coeff_q = coeff_q / (np.linalg.norm(coeff_q, axis=1, keepdims=True) + 1e-8)
-            
+
             basis_mu = self.basis_mu.cpu().numpy()
             basis_s = torch.exp(self.basis_log_s).cpu().numpy()
             basis_q = self.basis_q.cpu().numpy()
@@ -252,10 +253,10 @@ class MBDSolver3D:
             self.model.basis_mu, self.model.basis_log_s, self.model.basis_q
         ]
         mbd_params = [self.model.C, self.model.B]
-        
+
         self.optimizer_gaussian = optim.Adam(gaussian_params, lr=0.005)
         self.optimizer_mbd = optim.Adam(mbd_params, lr=0.01)
-        
+
         self.scheduler_gaussian = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_gaussian, patience=50, factor=0.5
         )
@@ -272,7 +273,7 @@ class MBDSolver3D:
         coeff_s = torch.exp(self.model.coeff_log_s)
         basis_s = torch.exp(self.model.basis_log_s)
         reg_loss = self.lambda_reg * (
-            torch.sum(self.model.C ** 2) + 
+            torch.sum(self.model.C ** 2) +
             torch.sum(coeff_s ** 2) + torch.sum(basis_s ** 2)
         )
 
@@ -492,9 +493,9 @@ basis_s = gaussian_params['basis_s']
 basis_q = gaussian_params['basis_q']
 
 # 绘制高斯中心点
-ax4.scatter(coeff_mu[:, 0], coeff_mu[:, 1], coeff_mu[:, 2], 
+ax4.scatter(coeff_mu[:, 0], coeff_mu[:, 1], coeff_mu[:, 2],
             c='red', s=25, alpha=0.7, label='Coeff Centers')
-ax4.scatter(basis_mu[:, 0], basis_mu[:, 1], basis_mu[:, 2], 
+ax4.scatter(basis_mu[:, 0], basis_mu[:, 1], basis_mu[:, 2],
             c='blue', s=35, marker='s', alpha=0.7, label='Basis Centers')
 
 # 绘制椅球体表示每个高斯的协方差形状
@@ -505,12 +506,12 @@ def draw_ellipsoid(ax, center, scale, quaternion, n_points=12, alpha=0.1, color=
     x = np.outer(np.cos(u), np.sin(v))
     y = np.outer(np.sin(u), np.sin(v))
     z = np.outer(np.ones(np.size(u)), np.cos(v))
-    
+
     # 应用尺度变换
     x = x * scale[0]
     y = y * scale[1]
     z = z * scale[2]
-    
+
     # 应用旋转变换 (四元数转旋转矩阵)
     q_norm = quaternion / (np.linalg.norm(quaternion) + 1e-8)
     w, x_q, y_q, z_q = q_norm
@@ -519,13 +520,13 @@ def draw_ellipsoid(ax, center, scale, quaternion, n_points=12, alpha=0.1, color=
         [2*x_q*y_q + 2*w*z_q, 1 - 2*x_q*x_q - 2*z_q*z_q, 2*y_q*z_q - 2*w*x_q],
         [2*x_q*z_q - 2*w*y_q, 2*y_q*z_q + 2*w*x_q, 1 - 2*x_q*x_q - 2*y_q*y_q]
     ])
-    
+
     points = np.array([x.flatten(), y.flatten(), z.flatten()])
     rotated_points = R @ points
     x_rot = rotated_points[0, :].reshape(x.shape) + center[0]
     y_rot = rotated_points[1, :].reshape(y.shape) + center[1]
     z_rot = rotated_points[2, :].reshape(z.shape) + center[2]
-    
+
     ax.plot_surface(x_rot, y_rot, z_rot, alpha=alpha, color=color, linewidth=0)
 
 # 选择部分高斯绘制椅球（避免过多重叠）
@@ -569,10 +570,10 @@ channel_colors = ['#E74C3C', '#27AE60', '#3498DB']
 channel_names = ['R', 'G', 'B']
 
 for c in range(C):
-    ax6.plot(gt_slice[y_line, :, c], 
+    ax6.plot(gt_slice[y_line, :, c],
             color=channel_colors[c], linestyle='-', alpha=0.7, linewidth=1.5,
             label=f'Original {channel_names[c]}')
-    ax6.plot(rec_slice[y_line, :, c], 
+    ax6.plot(rec_slice[y_line, :, c],
             color=channel_colors[c], linestyle='--', alpha=0.9, linewidth=1.5,
             label=f'Recon {channel_names[c]}')
 
@@ -592,7 +593,7 @@ basis_angles = 2 * np.arccos(np.clip(basis_q_norm[:, 0], -1, 1)) * 180 / np.pi
 
 ax7.hist(coeff_angles, bins=25, alpha=0.6, color='red', edgecolor='darkred', label='Coeff')
 ax7.hist(basis_angles, bins=25, alpha=0.6, color='blue', edgecolor='darkblue', label='Basis')
-ax7.axvline(x=coeff_angles.mean(), color='red', linestyle='--', linewidth=1.5, 
+ax7.axvline(x=coeff_angles.mean(), color='red', linestyle='--', linewidth=1.5,
             label=f'Coeff Mean: {coeff_angles.mean():.1f}°')
 ax7.axvline(x=basis_angles.mean(), color='blue', linestyle='--', linewidth=1.5,
             label=f'Basis Mean: {basis_angles.mean():.1f}°')
