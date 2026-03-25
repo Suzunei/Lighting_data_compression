@@ -2,6 +2,16 @@
 3D光照测试信号集合
 模拟各种真实环境光照场景，用于压缩算法测试
 每个函数返回: signal [D, H, W, C]
+
+使用方式：
+from test_signal_3d import get_test_signal_by_name, get_all_test_signals
+
+# 获取单个信号
+signal = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)
+
+# 获取所有信号
+all_signals = get_all_test_signals(grid_size=32, num_channels=3)
+
 """
 
 import torch
@@ -606,3 +616,4 @@ def get_test_signal_by_name(name, grid_size=32, num_channels=3):
     if name not in TEST_SIGNALS:
         raise ValueError(f"Unknown test signal: {name}. Available: {list(TEST_SIGNALS.keys())}")
     return TEST_SIGNALS[name](grid_size, num_channels)
+
