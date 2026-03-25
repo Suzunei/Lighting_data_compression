@@ -66,7 +66,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # 生成3D测试信号（与MBD_Control和MBD使用相同的RGB测试信号）
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个探针)
-ground_truth_SH = create_test_signal_3d(grid_size, num_channels=3)  # RGB数据 [D,H,W,C]
+ground_truth_SH = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)  # RGB数据 [D,H,W,C]
 D, H, W, C = ground_truth_SH.shape
 print(f"Generated 3D simulated SH coefficient volume size: {D}x{H}x{W}x{C}")
 

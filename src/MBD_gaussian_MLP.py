@@ -70,7 +70,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # Generate 3D test signal
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = create_test_signal_3d(grid_size, num_channels=3)
+ground_truth = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
@@ -87,19 +87,21 @@ print("\nStep 2: Building MBD model and solver...")
 
 class MBDCompressor3D(nn.Module):
     """
-    Moving Basis Decomposition (MBD) Compressor with 3D Trainable Gaussians
+    Moving Basis Decomposition (MBD) Compressor with 3D Trainable Gaussians + MLP Decoder
     Implements core formulas from the paper:
         c_l(x) = Σ_m φ_m(x) * c_{m,l}
         b_l(x) = Σ_n ψ_n(x) * B_{n,l}
-        f̂(x) = Σ_l c_l(x) * b_l(x)
+        f̂(x) = MLP(Σ_l c_l(x) * b_l(x), x)
 
     基于3DGS论文实现完整的3D高斯表示，包含位置、尺度、旋转（四元数）。
+    增加MLP解码器，将MBD重建结果与位置信息融合后输出最终SH系数。
     """
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
-                 coeff_kernel_scale=0.15, basis_kernel_scale=0.2):
+                 coeff_kernel_scale=0.15, basis_kernel_scale=0.2, mlp_hidden=64):
         super().__init__()
         self.L = num_bases
         self.data_dim = data_dim
+        self.mlp_hidden = mlp_hidden
 
         # ========== Coefficient 3D Gaussian Parameters ==========
         # 位置 mu: [M, 3] - 可训练3D位置
@@ -133,13 +135,22 @@ class MBDCompressor3D(nn.Module):
         self.C = nn.Parameter(torch.randn(coeff_res, self.L) * 0.1)
         self.B = nn.Parameter(torch.randn(basis_res, self.L, self.data_dim) * 0.1)
 
+        # ========== MLP Decoder ==========
+        # 输入: MBD重建结果(D) + 3D位置(3) -> 隐藏层 -> 输出SH系数(D)
+        self.decoder = nn.Sequential(
+            nn.Linear(data_dim + 3, mlp_hidden),  # 输入: MBD重建(D) + 位置(3)
+            nn.ReLU(),
+            nn.Linear(mlp_hidden, data_dim)  # 输出: 最终SH系数(D)
+        )
+
         # Initialize statistics
         self.M = coeff_res
         self.N = basis_res
-        print(f"MBD model initialized with 3D Trainable Gaussians:")
+        print(f"MBD+MLP model initialized with 3D Trainable Gaussians:")
         print(f"  Coefficient 3D Gaussians: M={self.M} (position + scale + rotation)")
         print(f"  Basis 3D Gaussians: N={self.N} (position + scale + rotation)")
         print(f"  Num bases: L={self.L}, Data dim: D={self.data_dim}")
+        print(f"  MLP Decoder: ({self.data_dim}+3) -> {mlp_hidden} -> {mlp_hidden} -> {self.data_dim}")
         print(f"  Transform: Position(3D) + Scale(3D) + Rotation(Quaternion)")
 
     def gaussian_function_3d(self, p, mu, s, q):
@@ -192,7 +203,7 @@ class MBDCompressor3D(nn.Module):
         return weights
 
     def forward(self, coords):
-        """Forward pass: reconstruct signal from 3D coordinates"""
+        """Forward pass: reconstruct signal from 3D coordinates with MLP decoder"""
         # 1. Compute 3D Gaussian weights for C and B
         phi_weights = self.compute_gaussian_weights_3d(
             coords, self.coeff_mu, self.coeff_log_s, self.coeff_q
@@ -209,18 +220,31 @@ class MBDCompressor3D(nn.Module):
         basis_interp_flat = torch.matmul(psi_weights, B_flat)  # [Q, L*D]
         moving_basis = basis_interp_flat.view(-1, self.L, self.data_dim)  # [Q, L, D]
 
-        # 4. Reconstruct signal f̂(x) = Σ_l c_l(x) * b_l(x)
-        reconstruction = torch.sum(moving_coeff.unsqueeze(-1) * moving_basis, dim=1)  # [Q, D]
+        # 4. Compute MBD reconstruction f̂_mbd(x) = Σ_l c_l(x) * b_l(x)
+        mbd_reconstruction = torch.sum(moving_coeff.unsqueeze(-1) * moving_basis, dim=1)  # [Q, D]
 
-        return reconstruction, moving_coeff, moving_basis
+        # 5. Apply MLP decoder: concat MBD reconstruction with position, then decode
+        mlp_input = torch.cat([mbd_reconstruction, coords], dim=1)  # [Q, D+3]
+        reconstruction = self.decoder(mlp_input)  # [Q, D]
+
+        return reconstruction, moving_coeff, moving_basis, mbd_reconstruction
 
     def get_compression_ratio(self, original_size):
-        """Compute compression ratio"""
+        """Compute compression ratio (including MLP parameters)"""
         # 3D高斯参数: mu(3) + log_s(3) + q(4) = 10 per gaussian
         # coeff: M*(10 + L), basis: N*(10 + L*D)
         coeff_params = self.M * (3 + 3 + 4 + self.L)
         basis_params = self.N * (3 + 3 + 4 + self.L * self.data_dim)
-        compressed_size = (coeff_params + basis_params) * 4
+
+        # MLP参数: 2层MLP
+        # Layer1: (D+3) * H + H (weights + bias)
+        # Layer2: H * D + D
+        H = self.mlp_hidden
+        D = self.data_dim
+        mlp_params = (D + 3) * H + H + H * D + D
+
+        total_params = coeff_params + basis_params + mlp_params
+        compressed_size = total_params * 4  # float32
         ratio = original_size / compressed_size
         return ratio, compressed_size
 
@@ -242,26 +266,33 @@ class MBDCompressor3D(nn.Module):
         }
 
 class MBDSolver3D:
-    """MBD 3D Solver with separate optimizers for Gaussian and MBD params"""
+    """MBD 3D Solver with separate optimizers for Gaussian, MBD and MLP params
+    支持两阶段训练：主训练阶段(所有参数) + 量化微调阶段(仅MLP)
+    """
     def __init__(self, model, lambda_reg=0.01):
         self.model = model
         self.lambda_reg = lambda_reg
 
-        # 为高斯参数和MBD参数使用不同的优化器
+        # 为高斯参数、MBD参数和MLP参数使用不同的优化器
         gaussian_params = [
             self.model.coeff_mu, self.model.coeff_log_s, self.model.coeff_q,
             self.model.basis_mu, self.model.basis_log_s, self.model.basis_q
         ]
         mbd_params = [self.model.C, self.model.B]
+        mlp_params = self.model.decoder.parameters()
 
         self.optimizer_gaussian = optim.Adam(gaussian_params, lr=0.005)
         self.optimizer_mbd = optim.Adam(mbd_params, lr=0.01)
+        self.optimizer_mlp = optim.Adam(mlp_params, lr=0.005)
 
         self.scheduler_gaussian = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_gaussian, patience=50, factor=0.5
         )
         self.scheduler_mbd = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_mbd, patience=50, factor=0.5
+        )
+        self.scheduler_mlp = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_mlp, patience=50, factor=0.5
         )
 
     def compute_loss(self, pred, target):
@@ -280,13 +311,22 @@ class MBDSolver3D:
         total_loss = recon_loss + reg_loss
         return total_loss, recon_loss, reg_loss
 
-    def train_step(self, coords_batch, target_batch):
-        """Single training step"""
-        self.optimizer_gaussian.zero_grad()
-        self.optimizer_mbd.zero_grad()
+    def train_step(self, coords_batch, target_batch, stage='main'):
+        """Single training step
+        stage='main': 训练所有参数（高斯+MBD+MLP）
+        stage='quant': 冻结高斯和MBD参数，只训练MLP（量化微调阶段）
+        """
+        if stage == 'quant':
+            # 量化阶段：只训练MLP，冻结高斯和MBD参数
+            self.optimizer_mlp.zero_grad()
+        else:
+            # 主训练阶段：训练所有参数
+            self.optimizer_gaussian.zero_grad()
+            self.optimizer_mbd.zero_grad()
+            self.optimizer_mlp.zero_grad()
 
         # Forward pass
-        pred, _, _ = self.model(coords_batch)
+        pred, _, _, _ = self.model(coords_batch)
 
         # Compute loss
         total_loss, recon_loss, reg_loss = self.compute_loss(pred, target_batch)
@@ -295,11 +335,18 @@ class MBDSolver3D:
         total_loss.backward()
 
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if stage == 'quant':
+            torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
         # Optimization
-        self.optimizer_gaussian.step()
-        self.optimizer_mbd.step()
+        if stage == 'quant':
+            self.optimizer_mlp.step()
+        else:
+            self.optimizer_gaussian.step()
+            self.optimizer_mbd.step()
+            self.optimizer_mlp.step()
 
         return {
             'total_loss': total_loss.item(),
@@ -307,46 +354,80 @@ class MBDSolver3D:
             'reg_loss': reg_loss.item()
         }
 
-    def train(self, coords, target, epochs=1000, batch_size=2048):
-        """Training loop"""
-        print(f"Starting 3D training, {epochs} epochs, batch_size={batch_size}")
+    def quantize_parameters(self, bits=10):
+        """
+        模拟参数量化 (论文第3.3节)。
+        在实际应用中，这里会实现公式13,14的量化与反量化，并微调。
+        此处为演示，仅模拟概念。
+        """
+        print(f"  [Sim] Quantizing parameters to {bits} bits...")
+        # 在实际实现中，这里会对高斯和MBD参数进行量化并替换为整数存储
+        # 随后会进行量化感知微调
+        pass
+
+    def train(self, coords, target, epochs_main=1000, epochs_quant_finetune=500, batch_size=2048):
+        """Training loop with two-stage training
+        Stage 1: 主训练阶段 - 训练所有参数（高斯+MBD+MLP）
+        Stage 2: 量化微调阶段 - 冻结高斯和MBD参数，只训练MLP
+        """
+        print(f"Starting MAIN training stage ({epochs_main} epochs), batch_size={batch_size}")
 
         losses = []
         num_samples = coords.shape[0]
 
-        for epoch in range(epochs):
+        # Stage 1: 主训练阶段
+        for epoch in range(epochs_main):
             # Random batch sampling
             indices = torch.randperm(num_samples)[:batch_size]
             coords_batch = coords[indices]
             target_batch = target[indices]
 
             # Training step
-            loss_dict = self.train_step(coords_batch, target_batch)
+            loss_dict = self.train_step(coords_batch, target_batch, 'main')
             losses.append(loss_dict)
 
             # Learning rate scheduling
             if epoch % 100 == 0:
                 self.scheduler_gaussian.step(loss_dict['total_loss'])
                 self.scheduler_mbd.step(loss_dict['total_loss'])
+                self.scheduler_mlp.step(loss_dict['total_loss'])
 
             # Print progress
-            if epoch % 200 == 0 or epoch == epochs - 1:
-                print(f"Epoch {epoch:4d}/{epochs} | "
+            if epoch % 200 == 0 or epoch == epochs_main - 1:
+                print(f"  Epoch {epoch:4d}/{epochs_main} | "
                       f"Total Loss: {loss_dict['total_loss']:.6f} | "
                       f"Recon: {loss_dict['recon_loss']:.6f} | "
                       f"Reg: {loss_dict['reg_loss']:.6f}")
 
+        # Stage 2: 量化微调阶段
+        print(f"\nStarting QUANTIZATION-AWARE finetuning ({epochs_quant_finetune} epochs)...")
+        print(f"  [Freeze] Gaussian and MBD parameters frozen, only training MLP decoder")
+        self.quantize_parameters(bits=10)
+
+        for epoch in range(epochs_quant_finetune):
+            indices = torch.randperm(num_samples)[:batch_size]
+            coords_batch = coords[indices]
+            target_batch = target[indices]
+
+            loss_dict = self.train_step(coords_batch, target_batch, 'quant')
+            losses.append(loss_dict)
+
+            if epoch % 100 == 0 or epoch == epochs_quant_finetune - 1:
+                print(f"  [Quant] Epoch {epoch:4d}/{epochs_quant_finetune} | "
+                      f"Loss: {loss_dict['total_loss']:.6f}")
+
         return losses
 
-# ==================== 对照组3: MBD + 3D可训练高斯（完整模型） ====================
-# 创建3D模型和求解器（使用可训练3D高斯）
+# ==================== 对照组: MBD + 3D可训练高斯 + MLP解码器 ====================
+# 创建3D模型和求解器（使用可训练3D高斯 + MLP解码器）
 model = MBDCompressor3D(
     num_bases=8,      # 基的数量L（与MBD_Control.py统一）
-    coeff_res=64,     # 系数3D高斯数量M（与MBD_Control.py统一）
-    basis_res=64,     # 基3D高斯数量N（与MBD_Control.py统一）
+    coeff_res=32,     # 系数3D高斯数量M（与MBD_Control.py统一）
+    basis_res=32,     # 基3D高斯数量N（与MBD_Control.py统一）
     data_dim=C,       # 数据维度D (RGB)
-    coeff_kernel_scale=0.15,   # 初始尺度（与MBD_Control.py统一）
-    basis_kernel_scale=0.2     # 初始尺度（与MBD_Control.py统一）
+    coeff_kernel_scale=0.18,   # 初始尺度（与MBD_Control.py统一）
+    basis_kernel_scale=0.22,    # 初始尺度（与MBD_Control.py统一）
+    mlp_hidden=32     # MLP隐藏层大小（与gaussian.py统一）
 )
 
 solver = MBDSolver3D(model, lambda_reg=1e-5)  # 与其他对照组统一正则化强度
@@ -358,9 +439,9 @@ print(f"Original size: {original_size/1024:.1f} KB")
 print(f"Compressed: {comp_size/1024:.1f} KB")
 print(f"Compression ratio: {comp_ratio:.1f}:1")
 
-# 训练模型
-print("\nStarting 3D compression (training)...")
-losses = solver.train(coords, target_data, epochs=1500, batch_size=4096)
+# 训练模型（两阶段训练：1200 main + 300 quant finetune，与gaussian.py统一）
+print("\nStarting 3D compression (two-stage training)...")
+losses = solver.train(coords, target_data, epochs_main=2000, epochs_quant_finetune=500, batch_size=4096)
 
 # ==================== Step 3: Evaluation and visualization ====================
 print("\nStep 3: Evaluating compression and reconstruction quality...")
@@ -368,10 +449,12 @@ print("\nStep 3: Evaluating compression and reconstruction quality...")
 # Reconstruct entire 3D volume using trained model
 model.eval()
 with torch.no_grad():
-    reconstructed, _, _ = model(coords)
+    reconstructed, _, _, mbd_recon = model(coords)
     reconstructed_vol = reconstructed.view(D, H, W, C).cpu().numpy()
+    mbd_recon_vol = mbd_recon.view(D, H, W, C).cpu().numpy()  # MBD重建（无MLP）
     # Clip to valid range [0, 1] to avoid imshow warnings
     reconstructed_vol = np.clip(reconstructed_vol, 0, 1)
+    mbd_recon_vol = np.clip(mbd_recon_vol, 0, 1)
 
 # Compute PSNR and SSIM used for evaluation the reconstruction quality
 def compute_psnr(img1, img2):
@@ -468,7 +551,7 @@ ax1.grid(False)
 # 2. MBD 3D Gaussian重建图
 ax2 = plt.subplot(2, 4, 2)
 im2 = ax2.imshow(rec_slice, vmin=0, vmax=1)
-ax2.set_title(f'3D Gaussian MBD Reconstruction\nPSNR: {psnr_value:.1f}dB, SSIM: {ssim_value:.4f}')
+ax2.set_title(f'MBD+MLP Reconstruction\nPSNR: {psnr_value:.1f}dB, SSIM: {ssim_value:.4f}')
 ax2.set_xlabel('X')
 ax2.grid(False)
 
@@ -557,10 +640,11 @@ reg_losses = [l['reg_loss'] for l in losses]
 ax5.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
 ax5.semilogy(recon_losses, 'g--', linewidth=1.5, alpha=0.7, label='Reconstruction Loss')
 ax5.semilogy(reg_losses, 'r:', linewidth=1, alpha=0.5, label='Regularization Loss')
+ax5.axvline(x=1500, color='orange', linestyle=':', alpha=0.7, label='Quant Finetune Start')
 ax5.set_title('Training Loss Curves (Log Scale)')
 ax5.set_xlabel('Iterations')
 ax5.set_ylabel('Loss Value')
-ax5.legend()
+ax5.legend(fontsize='x-small')
 ax5.grid(True, alpha=0.3)
 
 # 6. 训练数据拟合度对比曲线 (Z中间切片的一条线)
@@ -613,8 +697,8 @@ coeff_scale_ratios = coeff_s.max(axis=1) / (coeff_s.min(axis=1) + 1e-8)
 basis_scale_ratios = basis_s.max(axis=1) / (basis_s.min(axis=1) + 1e-8)
 
 info_text = f"""
-3D Gaussian MBD Compression Summary
-====================================
+MBD + 3D Gaussian + MLP Compression Summary
+============================================
 Original Data:
   Volume: {D}x{H}x{W}x{C} = {num_probes} points
   Size: {original_size/1024:.1f} KB
@@ -623,6 +707,7 @@ Compressed Model:
   Coeff 3D Gaussians (M): {model.M}
   Basis 3D Gaussians (N): {model.N}
   Num Bases (L): {model.L}
+  MLP Hidden: {model.mlp_hidden}
   Est. Size: {comp_size/1024:.1f} KB
   Ratio: {comp_ratio:.1f}:1
 
@@ -644,26 +729,28 @@ Reconstruction Quality:
 ax8.text(0.02, 0.5, info_text, fontsize=8,
         family='monospace', verticalalignment='center')
 
-plt.suptitle('MBD + 3D Gaussians - Control Group 3 (Full Model)', fontsize=16, y=1.02)
+plt.suptitle('MBD + 3D Gaussians + MLP Decoder - Control Group (Full Model)', fontsize=16, y=1.02)
 plt.tight_layout()
 plt.show()
 
 print("\nDemo completed!")
 print("="*70)
-print("对照组3: MBD + 3D可训练高斯演示完成！")
+print("对照组: MBD + 3D可训练高斯 + MLP解码器演示完成！")
 print("="*70)
 print(f"实验配置:")
-print(f"  - 模型类型: MBD + 3D Trainable Gaussians (完整模型)")
+print(f"  - 模型类型: MBD + 3D Trainable Gaussians + MLP Decoder")
 print(f"  - 系数3D高斯: M={model.M}")
 print(f"  - 基3D高斯: N={model.N}")
 print(f"  - 基数量: L={model.L}")
+print(f"  - MLP隐藏层: {model.mlp_hidden}")
 print(f"  - 数据通道: {C} (RGB)")
-print(f"  - 训练轮数: 1500 epochs")
+print(f"  - 训练轮数: 1500 main + 300 quant finetune")
 print(f"关键结论:")
 print(f"  1. 3D高斯参数: 位置(3D) + 尺度(3D) + 旋转(四元数)")
-print(f"  2. 协方差: Σ = R @ S @ S^T @ R^T (完整旋转支持)")
-print(f"  3. 压缩比: {comp_ratio:.1f}:1")
-print(f"  4. 重建质量: PSNR={psnr_value:.1f}dB, SSIM={ssim_value:.4f}")
-print(f"  5. Coeff旋转: {coeff_angles.mean():.1f}° ± {coeff_angles.std():.1f}°")
-print(f"  6. Basis旋转: {basis_angles.mean():.1f}° ± {basis_angles.std():.1f}°")
+print(f"  2. MLP解码器: MBD重建({C}) + pos(3) -> H({model.mlp_hidden}) -> RGB({C})")
+print(f"  3. 两阶段训练: 主训练(所有参数) + 量化微调(仅MLP)")
+print(f"  4. 压缩比: {comp_ratio:.1f}:1")
+print(f"  5. 重建质量: PSNR={psnr_value:.1f}dB, SSIM={ssim_value:.4f}")
+print(f"  6. Coeff旋转: {coeff_angles.mean():.1f}° ± {coeff_angles.std():.1f}°")
+print(f"  7. Basis旋转: {basis_angles.mean():.1f}° ± {basis_angles.std():.1f}°")
 print("="*70)
