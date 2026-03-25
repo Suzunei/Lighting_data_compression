@@ -70,7 +70,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # Generate 3D test signal
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)
+ground_truth = get_test_signal_by_name("outdoor_sunlight", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
@@ -468,7 +468,7 @@ ax1.grid(False)
 # 2. MBD 3D Gaussian重建图
 ax2 = plt.subplot(2, 4, 2)
 im2 = ax2.imshow(rec_slice, vmin=0, vmax=1)
-ax2.set_title(f'3D Gaussian MBD Reconstruction\nPSNR: {psnr_value:.1f}dB, SSIM: {ssim_value:.4f}')
+ax2.set_title(f'3D Gaussian + MBD Reconstruction\nPSNR: {psnr_value:.1f}dB, Ratio: {comp_ratio:.1f}:1')
 ax2.set_xlabel('X')
 ax2.grid(False)
 
@@ -476,7 +476,7 @@ ax2.grid(False)
 ax3 = plt.subplot(2, 4, 3)
 error = np.abs(gt_slice - rec_slice)
 error_img = ax3.imshow(error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
-ax3.set_title('Reconstruction Error')
+ax3.set_title('Reconstruction Error\nSSIM: {ssim_value:.4f}')
 ax3.set_xlabel('X')
 plt.colorbar(error_img, ax=ax3, fraction=0.046, pad=0.04)
 ax3.grid(False)

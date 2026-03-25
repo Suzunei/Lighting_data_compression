@@ -81,7 +81,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # 生成3D测试信号（模拟在3D网格上均匀分布的光探针SH系数）
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个探针)
-ground_truth_SH = get_test_signal_by_name("sunset", grid_size=32, num_channels=3)  # 模拟的SH系数 [D,H,W,C]
+ground_truth_SH = get_test_signal_by_name("outdoor_sunlight", grid_size=32, num_channels=3)  # 模拟的SH系数 [D,H,W,C]
 D, H, W, C = ground_truth_SH.shape
 print(f"Generated 3D simulated SH coefficient volume size: {D}x{H}x{W}x{C}")
 
@@ -449,14 +449,14 @@ plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 # 2. 高斯压缩重建图 (取前3通道)
 ax2 = plt.subplot(2, 4, 2)
 im2 = ax2.imshow(rec_slice[..., :3], vmin=0, vmax=1)
-ax2.set_title(f'3D Gaussian Reconstruction\nAvg PSNR: {avg_psnr:.1f} dB')
+ax2.set_title(f'3D Gaussian + MLP Reconstruction\nAvg PSNR: {avg_psnr:.1f} dB, Ratio: {comp_ratio:.1f}:1')
 plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
 # 3. 误差图 (所有通道平均)
 ax3 = plt.subplot(2, 4, 3)
 error = np.abs(gt_slice - rec_slice).mean(axis=-1)
 im3 = ax3.imshow(error, cmap='hot', vmin=0, vmax=0.1)
-ax3.set_title(f'Reconstruction Error\nAvg SSIM: {avg_ssim:.4f}')
+ax3.set_title(f'Reconstruction Error\nSSIM: {avg_ssim:.4f}')
 plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
 # 4. 3D高斯分布位置（以尺度表示）
