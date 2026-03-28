@@ -672,13 +672,13 @@ class MBDSolver3D:
 # ==================== Hierarchical MBD + MLP with Coarse-to-Fine Decoding ====================
 # Create model with hierarchical architecture
 model = MBDCompressor3D(
-    num_bases=8,              # Number of bases L
-    coeff_res=32,             # Coefficient 3D Gaussians M
-    basis_res=32,             # Basis 3D Gaussians N
+    num_bases=2,              # Number of bases L
+    coeff_res=64,             # Coefficient 3D Gaussians M
+    basis_res=64,             # Basis 3D Gaussians N
     data_dim=C,               # Data dimension D (RGB)
-    coeff_kernel_scale=0.18,  # Initial scale
-    basis_kernel_scale=0.22,  # Initial scale
-    mlp_hidden=48,            # MLP hidden size
+    coeff_kernel_scale=0.15,  # Initial scale
+    basis_kernel_scale=0.20,  # Initial scale
+    mlp_hidden=32,            # MLP hidden size
     pe_num_freqs=4,           # Positional encoding frequencies
     fine_mlp_depth=2          # Fine branch MLP depth
 )

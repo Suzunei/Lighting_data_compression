@@ -421,12 +421,12 @@ class MBDSolver3D:
 # ==================== 对照组: MBD + 3D可训练高斯 + MLP解码器 ====================
 # 创建3D模型和求解器（使用可训练3D高斯 + MLP解码器）
 model = MBDCompressor3D(
-    num_bases=8,      # 基的数量L（与MBD_Control.py统一）
-    coeff_res=32,     # 系数3D高斯数量M（与MBD_Control.py统一）
-    basis_res=32,     # 基3D高斯数量N（与MBD_Control.py统一）
+    num_bases=2,      # 基的数量L（与MBD_Control.py统一）
+    coeff_res=64,     # 系数3D高斯数量M（与MBD_Control.py统一）
+    basis_res=64,     # 基3D高斯数量N（与MBD_Control.py统一）
     data_dim=C,       # 数据维度D (RGB)
-    coeff_kernel_scale=0.18,   # 初始尺度（与MBD_Control.py统一）
-    basis_kernel_scale=0.22,    # 初始尺度（与MBD_Control.py统一）
+    coeff_kernel_scale=0.15,   # 初始尺度（与MBD_Control.py统一）
+    basis_kernel_scale=0.20,    # 初始尺度（与MBD_Control.py统一）
     mlp_hidden=32     # MLP隐藏层大小（与gaussian.py统一）
 )
 
