@@ -81,7 +81,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # 生成3D测试信号（模拟在3D网格上均匀分布的光探针SH系数）
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个探针)
-ground_truth_SH = get_test_signal_by_name("volumetric", grid_size=32, num_channels=3)  # 模拟的SH系数 [D,H,W,C]
+ground_truth_SH = get_test_signal_by_name("forest_dappled", grid_size=32, num_channels=3)  # 模拟的SH系数 [D,H,W,C]
 D, H, W, C = ground_truth_SH.shape
 print(f"Generated 3D simulated SH coefficient volume size: {D}x{H}x{W}x{C}")
 

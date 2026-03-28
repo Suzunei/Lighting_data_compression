@@ -70,7 +70,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # Generate 3D test signal
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = get_test_signal_by_name("volumetric", grid_size=32, num_channels=3)
+ground_truth = get_test_signal_by_name("forest_dappled", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
