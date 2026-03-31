@@ -361,7 +361,7 @@ class GaussianCompressionSolver3D:
 
 # ==================== 对照组4: 3D高斯+MLP（带解码器的高斯模型） ====================
 # 与 gaussian_control.py (纯高斯) 对比，验证MLP解码器的效果
-num_gaussians = 512  # 高斯数量（与gaussian_control统一）
+num_gaussians = 128  # 高斯数量（与gaussian_control统一）
 model = GaussianProbeCompressor3D(
     num_gaussians=num_gaussians,
     latent_dim=2,     # 潜在特征维度

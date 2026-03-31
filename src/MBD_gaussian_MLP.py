@@ -115,6 +115,9 @@ class MBDCompressor3D(nn.Module):
         self.coeff_q = nn.Parameter(torch.zeros(coeff_res, 4))
         with torch.no_grad():
             self.coeff_q[:, 0] = 1.0  # 初始化为单位四元数 [1, 0, 0, 0]
+        # 强度/不透明度 alpha: [M] - 可训练强度参数（logit空间）
+        # 让高斯的scale和强度共同决定贡献权重，更接近3DGS设计
+        self.coeff_alpha = nn.Parameter(torch.zeros(coeff_res))  # sigmoid后约0.5
 
         # ========== Basis 3D Gaussian Parameters ==========
         # 位置 mu: [N, 3]
@@ -128,12 +131,20 @@ class MBDCompressor3D(nn.Module):
         self.basis_q = nn.Parameter(torch.zeros(basis_res, 4))
         with torch.no_grad():
             self.basis_q[:, 0] = 1.0
+        # 强度/不透明度 alpha: [N] - 可训练强度参数（logit空间）
+        self.basis_alpha = nn.Parameter(torch.zeros(basis_res))
 
         # ========== MBD Coefficient/Basis Tensors ==========
         # C: [M, L] - scalar coefficients at coefficient control points
         # B: [N, L, D] - basis vectors at basis control points
         self.C = nn.Parameter(torch.randn(coeff_res, self.L) * 0.1)
         self.B = nn.Parameter(torch.randn(basis_res, self.L, self.data_dim) * 0.1)
+        
+        # ========== MBD Learnable Scale ==========
+        # 每个基l的可学习scale因子，让MBD的scale也参与训练
+        # f(x) = Σ_l scale_l * c_l(x) * b_l(x)
+        # 在log空间初始化为0（exp后为1.0），确保初始行为不变
+        self.mbd_log_scale = nn.Parameter(torch.zeros(self.L))  # [L]
 
         # ========== MLP Decoder ==========
         # 输入: MBD重建结果(D) + 3D位置(3) -> 隐藏层 -> 输出SH系数(D)
@@ -147,11 +158,12 @@ class MBDCompressor3D(nn.Module):
         self.M = coeff_res
         self.N = basis_res
         print(f"MBD+MLP model initialized with 3D Trainable Gaussians:")
-        print(f"  Coefficient 3D Gaussians: M={self.M} (position + scale + rotation)")
-        print(f"  Basis 3D Gaussians: N={self.N} (position + scale + rotation)")
+        print(f"  Coefficient 3D Gaussians: M={self.M} (position + scale + rotation + alpha)")
+        print(f"  Basis 3D Gaussians: N={self.N} (position + scale + rotation + alpha)")
         print(f"  Num bases: L={self.L}, Data dim: D={self.data_dim}")
+        print(f"  MBD Learnable Scale: [L={self.L}] per-basis scale factors")
         print(f"  MLP Decoder: ({self.data_dim}+3) -> {mlp_hidden} -> {mlp_hidden} -> {self.data_dim}")
-        print(f"  Transform: Position(3D) + Scale(3D) + Rotation(Quaternion)")
+        print(f"  Transform: Position(3D) + Scale(3D) + Rotation(Quaternion) + Alpha(intensity)")
 
     def gaussian_function_3d(self, p, mu, s, q):
         """
@@ -185,18 +197,24 @@ class MBDCompressor3D(nn.Module):
 
         return torch.exp(-0.5 * mahalanobis_sq)
 
-    def compute_gaussian_weights_3d(self, query_pts, mu, log_s, q):
+    def compute_gaussian_weights_3d(self, query_pts, mu, log_s, q, alpha=None):
         """
-        计算3D高斯权重（归一化）。
+        计算3D高斯权重（归一化），支持可学习强度参数。
 
         query_pts: [Q, 3] - 查询位置
         mu: [K, 3] - 高斯中心位置
         log_s: [K, 3] - 对数尺度
         q: [K, 4] - 四元数旋转
+        alpha: [K] - 强度参数（logit空间），可选
         返回: [Q, K] - 归一化高斯权重
         """
         s = torch.exp(log_s)  # [K, 3]
         gaussian_vals = self.gaussian_function_3d(query_pts, mu, s, q)  # [Q, K]
+
+        # 如果提供了alpha，则用强度加权（类似3DGS的opacity）
+        if alpha is not None:
+            intensity = torch.sigmoid(alpha)  # [K] -> (0, 1)
+            gaussian_vals = gaussian_vals * intensity.unsqueeze(0)  # [Q, K]
 
         # 归一化权重
         weights = gaussian_vals / (gaussian_vals.sum(dim=1, keepdim=True) + 1e-8)
@@ -204,12 +222,12 @@ class MBDCompressor3D(nn.Module):
 
     def forward(self, coords):
         """Forward pass: reconstruct signal from 3D coordinates with MLP decoder"""
-        # 1. Compute 3D Gaussian weights for C and B
+        # 1. Compute 3D Gaussian weights for C and B (with learnable alpha intensity)
         phi_weights = self.compute_gaussian_weights_3d(
-            coords, self.coeff_mu, self.coeff_log_s, self.coeff_q
+            coords, self.coeff_mu, self.coeff_log_s, self.coeff_q, self.coeff_alpha
         )  # [Q, M]
         psi_weights = self.compute_gaussian_weights_3d(
-            coords, self.basis_mu, self.basis_log_s, self.basis_q
+            coords, self.basis_mu, self.basis_log_s, self.basis_q, self.basis_alpha
         )  # [Q, N]
 
         # 2. Compute moving coefficients c_l(x) = Σ_m φ_m(x) * C_{m,l}
@@ -220,8 +238,10 @@ class MBDCompressor3D(nn.Module):
         basis_interp_flat = torch.matmul(psi_weights, B_flat)  # [Q, L*D]
         moving_basis = basis_interp_flat.view(-1, self.L, self.data_dim)  # [Q, L, D]
 
-        # 4. Compute MBD reconstruction f̂_mbd(x) = Σ_l c_l(x) * b_l(x)
-        mbd_reconstruction = torch.sum(moving_coeff.unsqueeze(-1) * moving_basis, dim=1)  # [Q, D]
+        # 4. Compute MBD reconstruction with learnable scale: f̂_mbd(x) = Σ_l scale_l * c_l(x) * b_l(x)
+        mbd_scale = torch.exp(self.mbd_log_scale)  # [L] - 可学习的scale因子
+        scaled_coeff = moving_coeff * mbd_scale.unsqueeze(0)  # [Q, L] * [1, L] = [Q, L]
+        mbd_reconstruction = torch.sum(scaled_coeff.unsqueeze(-1) * moving_basis, dim=1)  # [Q, D]
 
         # 5. Apply MLP decoder: concat MBD reconstruction with position, then decode
         mlp_input = torch.cat([mbd_reconstruction, coords], dim=1)  # [Q, D+3]
@@ -231,10 +251,12 @@ class MBDCompressor3D(nn.Module):
 
     def get_compression_ratio(self, original_size):
         """Compute compression ratio (including MLP parameters)"""
-        # 3D高斯参数: mu(3) + log_s(3) + q(4) = 10 per gaussian
-        # coeff: M*(10 + L), basis: N*(10 + L*D)
-        coeff_params = self.M * (3 + 3 + 4 + self.L)
-        basis_params = self.N * (3 + 3 + 4 + self.L * self.data_dim)
+        # 3D高斯参数: mu(3) + log_s(3) + q(4) + alpha(1) = 11 per gaussian
+        # coeff: M*(11 + L), basis: N*(11 + L*D)
+        # MBD scale: L个scale因子
+        coeff_params = self.M * (3 + 3 + 4 + 1 + self.L)
+        basis_params = self.N * (3 + 3 + 4 + 1 + self.L * self.data_dim)
+        mbd_scale_params = self.L  # MBD可学习scale
 
         # MLP参数: 2层MLP
         # Layer1: (D+3) * H + H (weights + bias)
@@ -243,7 +265,7 @@ class MBDCompressor3D(nn.Module):
         D = self.data_dim
         mlp_params = (D + 3) * H + H + H * D + D
 
-        total_params = coeff_params + basis_params + mlp_params
+        total_params = coeff_params + basis_params + mbd_scale_params + mlp_params
         compressed_size = total_params * 4  # float32
         ratio = original_size / compressed_size
         return ratio, compressed_size
@@ -255,14 +277,18 @@ class MBDCompressor3D(nn.Module):
             coeff_s = torch.exp(self.coeff_log_s).cpu().numpy()
             coeff_q = self.coeff_q.cpu().numpy()
             coeff_q = coeff_q / (np.linalg.norm(coeff_q, axis=1, keepdims=True) + 1e-8)
+            coeff_alpha = torch.sigmoid(self.coeff_alpha).cpu().numpy()
 
             basis_mu = self.basis_mu.cpu().numpy()
             basis_s = torch.exp(self.basis_log_s).cpu().numpy()
             basis_q = self.basis_q.cpu().numpy()
             basis_q = basis_q / (np.linalg.norm(basis_q, axis=1, keepdims=True) + 1e-8)
+            basis_alpha = torch.sigmoid(self.basis_alpha).cpu().numpy()
+            mbd_scale = torch.exp(self.mbd_log_scale).cpu().numpy()
         return {
-            'coeff_mu': coeff_mu, 'coeff_s': coeff_s, 'coeff_q': coeff_q,
-            'basis_mu': basis_mu, 'basis_s': basis_s, 'basis_q': basis_q
+            'coeff_mu': coeff_mu, 'coeff_s': coeff_s, 'coeff_q': coeff_q, 'coeff_alpha': coeff_alpha,
+            'basis_mu': basis_mu, 'basis_s': basis_s, 'basis_q': basis_q, 'basis_alpha': basis_alpha,
+            'mbd_scale': mbd_scale
         }
 
 class MBDSolver3D:
@@ -274,11 +300,12 @@ class MBDSolver3D:
         self.lambda_reg = lambda_reg
 
         # 为高斯参数、MBD参数和MLP参数使用不同的优化器
+        # 高斯参数现在包含alpha强度参数
         gaussian_params = [
-            self.model.coeff_mu, self.model.coeff_log_s, self.model.coeff_q,
-            self.model.basis_mu, self.model.basis_log_s, self.model.basis_q
+            self.model.coeff_mu, self.model.coeff_log_s, self.model.coeff_q, self.model.coeff_alpha,
+            self.model.basis_mu, self.model.basis_log_s, self.model.basis_q, self.model.basis_alpha
         ]
-        mbd_params = [self.model.C, self.model.B]
+        mbd_params = [self.model.C, self.model.B, self.model.mbd_log_scale]
         mlp_params = self.model.decoder.parameters()
 
         self.optimizer_gaussian = optim.Adam(gaussian_params, lr=0.005)
@@ -571,9 +598,12 @@ gaussian_params = model.get_gaussian_params()
 coeff_mu = gaussian_params['coeff_mu']
 coeff_s = gaussian_params['coeff_s']
 coeff_q = gaussian_params['coeff_q']
+coeff_alpha = gaussian_params['coeff_alpha']
 basis_mu = gaussian_params['basis_mu']
 basis_s = gaussian_params['basis_s']
 basis_q = gaussian_params['basis_q']
+basis_alpha = gaussian_params['basis_alpha']
+mbd_scale = gaussian_params['mbd_scale']
 
 # 绘制高斯中心点
 ax4.scatter(coeff_mu[:, 0], coeff_mu[:, 1], coeff_mu[:, 2],
@@ -667,22 +697,24 @@ ax6.set_ylabel('Value')
 ax6.legend(loc='upper right', fontsize='x-small', ncol=2)
 ax6.grid(True, alpha=0.3)
 
-# 7. 旋转角度分布 (四元数转换为角度)
+# 7. Alpha强度分布（新增）
 ax7 = plt.subplot(2, 4, 7)
 
+# 计算旋转角度用于统计
 coeff_q_norm = coeff_q / (np.linalg.norm(coeff_q, axis=1, keepdims=True) + 1e-8)
 basis_q_norm = basis_q / (np.linalg.norm(basis_q, axis=1, keepdims=True) + 1e-8)
 coeff_angles = 2 * np.arccos(np.clip(coeff_q_norm[:, 0], -1, 1)) * 180 / np.pi
 basis_angles = 2 * np.arccos(np.clip(basis_q_norm[:, 0], -1, 1)) * 180 / np.pi
 
-ax7.hist(coeff_angles, bins=25, alpha=0.6, color='red', edgecolor='darkred', label='Coeff')
-ax7.hist(basis_angles, bins=25, alpha=0.6, color='blue', edgecolor='darkblue', label='Basis')
-ax7.axvline(x=coeff_angles.mean(), color='red', linestyle='--', linewidth=1.5,
-            label=f'Coeff Mean: {coeff_angles.mean():.1f}°')
-ax7.axvline(x=basis_angles.mean(), color='blue', linestyle='--', linewidth=1.5,
-            label=f'Basis Mean: {basis_angles.mean():.1f}°')
-ax7.set_title('Rotation Angle Distribution')
-ax7.set_xlabel('Rotation Angle (degrees)')
+# 绘制Alpha强度分布
+ax7.hist(coeff_alpha, bins=25, alpha=0.6, color='red', edgecolor='darkred', label='Coeff Alpha')
+ax7.hist(basis_alpha, bins=25, alpha=0.6, color='blue', edgecolor='darkblue', label='Basis Alpha')
+ax7.axvline(x=coeff_alpha.mean(), color='red', linestyle='--', linewidth=1.5,
+            label=f'Coeff Mean: {coeff_alpha.mean():.3f}')
+ax7.axvline(x=basis_alpha.mean(), color='blue', linestyle='--', linewidth=1.5,
+            label=f'Basis Mean: {basis_alpha.mean():.3f}')
+ax7.set_title('Alpha (Intensity) Distribution')
+ax7.set_xlabel('Alpha Value (0-1)')
 ax7.set_ylabel('Count')
 ax7.legend(fontsize='x-small')
 ax7.grid(True, alpha=0.3)
@@ -707,17 +739,20 @@ Compressed Model:
   Coeff 3D Gaussians (M): {model.M}
   Basis 3D Gaussians (N): {model.N}
   Num Bases (L): {model.L}
+  MBD Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]
   MLP Hidden: {model.mlp_hidden}
   Est. Size: {comp_size/1024:.1f} KB
   Ratio: {comp_ratio:.1f}:1
 
 Coeff Transform Stats:
   Scale: {coeff_s.mean():.4f} ± {coeff_s.std():.4f}
+  Alpha: {coeff_alpha.mean():.3f} ± {coeff_alpha.std():.3f}
   Anisotropy: {coeff_scale_ratios.mean():.2f} ± {coeff_scale_ratios.std():.2f}
   Rotation: {coeff_angles.mean():.1f}° ± {coeff_angles.std():.1f}°
 
 Basis Transform Stats:
   Scale: {basis_s.mean():.4f} ± {basis_s.std():.4f}
+  Alpha: {basis_alpha.mean():.3f} ± {basis_alpha.std():.3f}
   Anisotropy: {basis_scale_ratios.mean():.2f} ± {basis_scale_ratios.std():.2f}
   Rotation: {basis_angles.mean():.1f}° ± {basis_angles.std():.1f}°
 
@@ -746,11 +781,14 @@ print(f"  - MLP隐藏层: {model.mlp_hidden}")
 print(f"  - 数据通道: {C} (RGB)")
 print(f"  - 训练轮数: 1500 main + 300 quant finetune")
 print(f"关键结论:")
-print(f"  1. 3D高斯参数: 位置(3D) + 尺度(3D) + 旋转(四元数)")
-print(f"  2. MLP解码器: MBD重建({C}) + pos(3) -> H({model.mlp_hidden}) -> RGB({C})")
-print(f"  3. 两阶段训练: 主训练(所有参数) + 量化微调(仅MLP)")
-print(f"  4. 压缩比: {comp_ratio:.1f}:1")
-print(f"  5. 重建质量: PSNR={psnr_value:.1f}dB, SSIM={ssim_value:.4f}")
-print(f"  6. Coeff旋转: {coeff_angles.mean():.1f}° ± {coeff_angles.std():.1f}°")
-print(f"  7. Basis旋转: {basis_angles.mean():.1f}° ± {basis_angles.std():.1f}°")
+print(f"  1. 3D高斯参数: 位置(3D) + 尺度(3D) + 旋转(四元数) + Alpha(强度)")
+print(f"  2. MBD可学习Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]")
+print(f"  3. MLP解码器: MBD重建({C}) + pos(3) -> H({model.mlp_hidden}) -> RGB({C})")
+print(f"  4. 两阶段训练: 主训练(所有参数) + 量化微调(仅MLP)")
+print(f"  5. 压缩比: {comp_ratio:.1f}:1")
+print(f"  6. 重建质量: PSNR={psnr_value:.1f}dB, SSIM={ssim_value:.4f}")
+print(f"  7. Coeff Alpha: {coeff_alpha.mean():.3f} ± {coeff_alpha.std():.3f}")
+print(f"  8. Basis Alpha: {basis_alpha.mean():.3f} ± {basis_alpha.std():.3f}")
+print(f"  9. Coeff旋转: {coeff_angles.mean():.1f}° ± {coeff_angles.std():.1f}°")
+print(f"  10. Basis旋转: {basis_angles.mean():.1f}° ± {basis_angles.std():.1f}°")
 print("="*70)
