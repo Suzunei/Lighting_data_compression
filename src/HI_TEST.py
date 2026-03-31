@@ -122,26 +122,29 @@ class MBDCompressor3D(nn.Module):
             b_l(x) = Σ_n ψ_n(x) * B_{n,l}
             f_coarse(x) = Σ_l c_l(x) * b_l(x)
         
-        Fine Branch (MLP): High-frequency details
-            f_fine(x) = MLP(PE(x))
+        Fine Branch (Gaussian + MLP): High-frequency details with spatial awareness
+            φ_fine(x) = Gaussian weights from fine anchors
+            f_fine(x) = MLP(PE(x), φ_fine(x)) - Gaussian-guided high-freq learning
         
         Adaptive Gate: Position-dependent fusion
             gate(x) = σ(MLP_gate(x))
             f_final(x) = (1 - gate) * f_coarse + gate * f_fine
     
-    Key Innovation: Hierarchical decoding with adaptive gating allows:
-        - MBD to focus on smooth, low-frequency components (better compression)
-        - MLP to capture high-frequency details (better quality)
-        - Gate to adaptively blend based on local complexity
+    Key Innovation: Hierarchical decoding with Gaussian-guided Fine Branch:
+        - MBD (large Gaussians): smooth, low-frequency components (compression)
+        - Fine Gaussians (small, sparse): anchor high-frequency detail regions
+        - MLP with Gaussian guidance: capture localized high-frequency details
+        - Gate: adaptively blend based on local complexity
     """
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
                  coeff_kernel_scale=0.15, basis_kernel_scale=0.2, mlp_hidden=64,
-                 pe_num_freqs=4, fine_mlp_depth=2):
+                 pe_num_freqs=4, fine_mlp_depth=2, fine_gaussian_res=16, fine_kernel_scale=0.08):
         super().__init__()
         self.L = num_bases
         self.data_dim = data_dim
         self.mlp_hidden = mlp_hidden
         self.pe_num_freqs = pe_num_freqs
+        self.fine_gaussian_res = fine_gaussian_res
 
         # ========== Coefficient 3D Gaussian Parameters ==========
         # Position mu: [M, 3] - Trainable 3D position
@@ -174,6 +177,24 @@ class MBDCompressor3D(nn.Module):
         # Intensity/opacity alpha: [N] - Learnable intensity parameter (logit space)
         self.basis_alpha = nn.Parameter(torch.zeros(basis_res))
 
+        # ========== Fine Gaussian Parameters (NEW: for high-frequency anchoring) ==========
+        # Sparse, small-scale Gaussians that learn to locate high-frequency regions
+        # Position mu: [F, 3] - learns to anchor at detail regions (edges, shadows, etc.)
+        self.fine_mu = nn.Parameter(torch.rand(fine_gaussian_res, 3))
+        # Log-scale log_s: [F, 3] - smaller scale for local detail capture
+        init_fine_log_scale = np.log(fine_kernel_scale)
+        self.fine_log_s = nn.Parameter(
+            torch.ones(fine_gaussian_res, 3) * init_fine_log_scale + torch.randn(fine_gaussian_res, 3) * 0.1
+        )
+        # Quaternion rotation q: [F, 4]
+        self.fine_q = nn.Parameter(torch.zeros(fine_gaussian_res, 4))
+        with torch.no_grad():
+            self.fine_q[:, 0] = 1.0
+        # Intensity/opacity alpha: [F] - learnable importance for each fine gaussian
+        self.fine_alpha = nn.Parameter(torch.zeros(fine_gaussian_res))
+        # Fine feature vectors: [F, D] - learnable features at each fine anchor
+        self.fine_features = nn.Parameter(torch.randn(fine_gaussian_res, data_dim) * 0.1)
+
         # ========== MBD Coefficient/Basis Tensors ==========
         # C: [M, L] - scalar coefficients at coefficient control points
         # B: [N, L, D] - basis vectors at basis control points
@@ -190,22 +211,24 @@ class MBDCompressor3D(nn.Module):
         self.pos_encoder = PositionalEncoding(num_freqs=pe_num_freqs)
         pe_dim = self.pos_encoder.get_output_dim(3)  # 3 + 3*2*num_freqs
 
-        # ========== Fine Branch: MLP with Positional Encoding ==========
-        # Captures high-frequency details that MBD cannot represent
+        # ========== Fine Branch: Gaussian-Guided MLP ==========
+        # Input: PE(x) + fine_gaussian_weights -> learns high-frequency with spatial awareness
+        # The gaussian weights provide "where am I relative to detail anchors" information
+        fine_input_dim = pe_dim + fine_gaussian_res  # PE features + Gaussian weights
         fine_layers = []
-        fine_layers.append(nn.Linear(pe_dim, mlp_hidden))
+        fine_layers.append(nn.Linear(fine_input_dim, mlp_hidden))
         fine_layers.append(nn.ReLU())
         for _ in range(fine_mlp_depth - 1):
             fine_layers.append(nn.Linear(mlp_hidden, mlp_hidden))
             fine_layers.append(nn.ReLU())
         fine_layers.append(nn.Linear(mlp_hidden, data_dim))
-        self.fine_branch = nn.Sequential(*fine_layers)
+        self.fine_mlp = nn.Sequential(*fine_layers)
 
         # ========== Adaptive Gate Network ==========
         # Learns position-dependent blending weight between coarse and fine
-        # Higher gate value = more reliance on fine branch (high-frequency regions)
+        # Now also takes fine gaussian weights as input for better gating
         self.gate_network = nn.Sequential(
-            nn.Linear(3, mlp_hidden // 2),
+            nn.Linear(3 + fine_gaussian_res, mlp_hidden // 2),
             nn.ReLU(),
             nn.Linear(mlp_hidden // 2, 1),
             nn.Sigmoid()  # Output in [0, 1]
@@ -222,17 +245,21 @@ class MBDCompressor3D(nn.Module):
         # Initialize statistics
         self.M = coeff_res
         self.N = basis_res
-        print(f"Hierarchical MBD+MLP model initialized (Coarse-to-Fine):")
+        self.F = fine_gaussian_res
+        print(f"Hierarchical MBD+Gaussian+MLP model initialized (Coarse-to-Fine):")
         print(f"  [Coarse Branch] MBD with 3D Gaussians:")
         print(f"    - Coefficient Gaussians: M={self.M} (position + scale + rotation + alpha)")
         print(f"    - Basis Gaussians: N={self.N} (position + scale + rotation + alpha)")
         print(f"    - Num bases: L={self.L}")
         print(f"    - MBD Learnable Scale: [L={self.L}] per-basis scale factors")
-        print(f"  [Fine Branch] MLP with Positional Encoding:")
+        print(f"  [Fine Branch] Gaussian-Guided MLP:")
+        print(f"    - Fine Gaussians: F={self.F} (small-scale anchors for high-freq)")
+        print(f"    - Fine kernel scale: {fine_kernel_scale:.3f}")
         print(f"    - PE frequencies: {pe_num_freqs} -> dim {pe_dim}")
+        print(f"    - MLP input: PE({pe_dim}) + GaussianWeights({fine_gaussian_res}) = {fine_input_dim}")
         print(f"    - MLP depth: {fine_mlp_depth} layers, hidden={mlp_hidden}")
-        print(f"  [Gate Network] Adaptive blending:")
-        print(f"    - Input: 3D position -> Output: gate weight")
+        print(f"  [Gate Network] Gaussian-aware adaptive blending:")
+        print(f"    - Input: 3D position + Fine Gaussian weights")
         print(f"  [Residual Refiner] Final enhancement")
 
     def gaussian_function_3d(self, p, mu, s, q):
@@ -326,27 +353,42 @@ class MBDCompressor3D(nn.Module):
         scaled_coeff = moving_coeff * mbd_scale.unsqueeze(0)  # [Q, L] * [1, L] = [Q, L]
         coarse_output = torch.sum(scaled_coeff.unsqueeze(-1) * moving_basis, dim=1)  # [Q, D]
 
-        # ============ Fine Branch: MLP with Positional Encoding ============
-        # 5. Apply positional encoding to coordinates
+        # ============ Fine Branch: Gaussian-Guided MLP ============
+        # 5. Compute Fine Gaussian weights (for high-frequency region awareness)
+        fine_weights = self.compute_gaussian_weights_3d(
+            coords, self.fine_mu, self.fine_log_s, self.fine_q, self.fine_alpha
+        )  # [Q, F]
+        
+        # 6. Apply positional encoding to coordinates
         coords_encoded = self.pos_encoder(coords)  # [Q, pe_dim]
         
-        # 6. Fine MLP output: high-frequency details
-        fine_output = self.fine_branch(coords_encoded)  # [Q, D]
-
-        # ============ Adaptive Gating ============
-        # 7. Compute position-dependent gate weights
-        gate = self.gate_network(coords)  # [Q, 1]
+        # 7. Concatenate PE features with Fine Gaussian weights for spatial awareness
+        fine_input = torch.cat([coords_encoded, fine_weights], dim=-1)  # [Q, pe_dim + F]
         
-        # 8. Blend coarse and fine branches
-        # gate=0 -> pure coarse (MBD), gate=1 -> pure fine (MLP)
+        # 8. Fine MLP output: high-frequency details with Gaussian guidance
+        fine_mlp_output = self.fine_mlp(fine_input)  # [Q, D]
+        
+        # 9. Direct Gaussian interpolation for fine features (additional detail source)
+        fine_gaussian_interp = torch.matmul(fine_weights, self.fine_features)  # [Q, D]
+        
+        # 10. Combine MLP output with Gaussian-interpolated features
+        fine_output = fine_mlp_output + 0.3 * fine_gaussian_interp  # [Q, D]
+
+        # ============ Adaptive Gating (Gaussian-aware) ============
+        # 11. Compute position-dependent gate weights with Fine Gaussian awareness
+        gate_input = torch.cat([coords, fine_weights], dim=-1)  # [Q, 3 + F]
+        gate = self.gate_network(gate_input)  # [Q, 1]
+        
+        # 12. Blend coarse and fine branches
+        # gate=0 -> pure coarse (MBD), gate=1 -> pure fine (Gaussian+MLP)
         blended = (1 - gate) * coarse_output + gate * fine_output  # [Q, D]
 
         # ============ Residual Refinement ============
-        # 9. Small residual correction
+        # 13. Small residual correction
         refine_input = torch.cat([blended, coords], dim=1)  # [Q, D+3]
         residual = self.residual_refiner(refine_input)  # [Q, D]
         
-        # 10. Final output with residual connection
+        # 14. Final output with residual connection
         reconstruction = blended + 0.1 * residual  # [Q, D]
 
         if return_components:
@@ -354,6 +396,8 @@ class MBDCompressor3D(nn.Module):
                 'reconstruction': reconstruction,
                 'coarse_output': coarse_output,
                 'fine_output': fine_output,
+                'fine_weights': fine_weights,
+                'fine_gaussian_interp': fine_gaussian_interp,
                 'gate': gate,
                 'blended': blended,
                 'moving_coeff': moving_coeff,
@@ -373,13 +417,16 @@ class MBDCompressor3D(nn.Module):
         coeff_params = self.M * (3 + 3 + 4 + 1 + self.L)
         basis_params = self.N * (3 + 3 + 4 + 1 + self.L * self.data_dim)
         mbd_scale_params = self.L  # MBD learnable scale
+        
+        # Fine Gaussian params: mu(3) + log_s(3) + q(4) + alpha(1) + features(D) = 11 + D per gaussian
+        fine_gaussian_params = self.F * (3 + 3 + 4 + 1 + self.data_dim)
 
         # Count all network parameters
-        fine_branch_params = sum(p.numel() for p in self.fine_branch.parameters())
+        fine_mlp_params = sum(p.numel() for p in self.fine_mlp.parameters())
         gate_params = sum(p.numel() for p in self.gate_network.parameters())
         refiner_params = sum(p.numel() for p in self.residual_refiner.parameters())
 
-        total_params = coeff_params + basis_params + mbd_scale_params + fine_branch_params + gate_params + refiner_params
+        total_params = coeff_params + basis_params + mbd_scale_params + fine_gaussian_params + fine_mlp_params + gate_params + refiner_params
         compressed_size = total_params * bytes_per_param  # 支持不同精度
         ratio = original_size / compressed_size
         return ratio, compressed_size
@@ -390,16 +437,22 @@ class MBDCompressor3D(nn.Module):
         coeff_params = self.M * (3 + 3 + 4 + 1 + self.L)
         basis_params = self.N * (3 + 3 + 4 + 1 + self.L * self.data_dim)
         mbd_scale_params = self.L  # MBD learnable scale
-        fine_params = sum(p.numel() for p in self.fine_branch.parameters())
+        
+        # Fine Gaussian params: mu(3) + log_s(3) + q(4) + alpha(1) + features(D)
+        fine_gaussian_params = self.F * (3 + 3 + 4 + 1 + self.data_dim)
+        fine_mlp_params = sum(p.numel() for p in self.fine_mlp.parameters())
+        
         gate_params = sum(p.numel() for p in self.gate_network.parameters())
         refiner_params = sum(p.numel() for p in self.residual_refiner.parameters())
         
         return {
             'coarse_mbd': coeff_params + basis_params + mbd_scale_params,
-            'fine_mlp': fine_params,
+            'fine_gaussian': fine_gaussian_params,
+            'fine_mlp': fine_mlp_params,
+            'fine_total': fine_gaussian_params + fine_mlp_params,
             'gate_network': gate_params,
             'residual_refiner': refiner_params,
-            'total': coeff_params + basis_params + mbd_scale_params + fine_params + gate_params + refiner_params
+            'total': coeff_params + basis_params + mbd_scale_params + fine_gaussian_params + fine_mlp_params + gate_params + refiner_params
         }
 
     def get_gaussian_params(self):
@@ -417,10 +470,20 @@ class MBDCompressor3D(nn.Module):
             basis_q = basis_q / (np.linalg.norm(basis_q, axis=1, keepdims=True) + 1e-8)
             basis_alpha = torch.sigmoid(self.basis_alpha).cpu().numpy()
             mbd_scale = torch.exp(self.mbd_log_scale).cpu().numpy()
+            
+            # Fine Gaussian parameters
+            fine_mu = self.fine_mu.cpu().numpy()
+            fine_s = torch.exp(self.fine_log_s).cpu().numpy()
+            fine_q = self.fine_q.cpu().numpy()
+            fine_q = fine_q / (np.linalg.norm(fine_q, axis=1, keepdims=True) + 1e-8)
+            fine_alpha = torch.sigmoid(self.fine_alpha).cpu().numpy()
+            fine_features = self.fine_features.cpu().numpy()
         return {
             'coeff_mu': coeff_mu, 'coeff_s': coeff_s, 'coeff_q': coeff_q, 'coeff_alpha': coeff_alpha,
             'basis_mu': basis_mu, 'basis_s': basis_s, 'basis_q': basis_q, 'basis_alpha': basis_alpha,
-            'mbd_scale': mbd_scale
+            'mbd_scale': mbd_scale,
+            'fine_mu': fine_mu, 'fine_s': fine_s, 'fine_q': fine_q, 'fine_alpha': fine_alpha,
+            'fine_features': fine_features
         }
 
     def quantize_to_fp16(self):
@@ -450,7 +513,7 @@ class MBDSolver3D:
     
     Training Strategy:
         Stage 1 (Coarse Focus): Train MBD branch with higher weight on coarse loss
-        Stage 2 (Fine Focus): Gradually shift focus to fine branch
+        Stage 2 (Fine Focus): Gradually shift focus to fine branch (Gaussian + MLP)
         Stage 3 (Joint Refinement): Fine-tune all branches together
     """
     def __init__(self, model, lambda_reg=0.01, lambda_coarse=0.5):
@@ -460,31 +523,43 @@ class MBDSolver3D:
         self.initial_lambda_coarse = lambda_coarse
 
         # Separate parameter groups for different learning dynamics
-        # Gaussian params now include alpha intensity parameters
-        gaussian_params = [
+        # Coarse Gaussian params (for MBD)
+        coarse_gaussian_params = [
             self.model.coeff_mu, self.model.coeff_log_s, self.model.coeff_q, self.model.coeff_alpha,
             self.model.basis_mu, self.model.basis_log_s, self.model.basis_q, self.model.basis_alpha
         ]
         mbd_params = [self.model.C, self.model.B, self.model.mbd_log_scale]
-        fine_params = list(self.model.fine_branch.parameters())
+        
+        # Fine Gaussian params (NEW: for high-frequency anchoring)
+        fine_gaussian_params = [
+            self.model.fine_mu, self.model.fine_log_s, self.model.fine_q, 
+            self.model.fine_alpha, self.model.fine_features
+        ]
+        
+        # Fine MLP params
+        fine_mlp_params = list(self.model.fine_mlp.parameters())
         gate_params = list(self.model.gate_network.parameters())
         refiner_params = list(self.model.residual_refiner.parameters())
 
         # Different learning rates for different components
-        self.optimizer_gaussian = optim.Adam(gaussian_params, lr=0.005)
+        self.optimizer_coarse_gaussian = optim.Adam(coarse_gaussian_params, lr=0.005)
         self.optimizer_mbd = optim.Adam(mbd_params, lr=0.01)
-        self.optimizer_fine = optim.Adam(fine_params, lr=0.003)
+        self.optimizer_fine_gaussian = optim.Adam(fine_gaussian_params, lr=0.008)  # Fine Gaussians
+        self.optimizer_fine_mlp = optim.Adam(fine_mlp_params, lr=0.003)
         self.optimizer_gate = optim.Adam(gate_params, lr=0.002)
         self.optimizer_refiner = optim.Adam(refiner_params, lr=0.003)
 
-        self.scheduler_gaussian = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer_gaussian, patience=50, factor=0.5
+        self.scheduler_coarse_gaussian = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_coarse_gaussian, patience=50, factor=0.5
         )
         self.scheduler_mbd = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_mbd, patience=50, factor=0.5
         )
-        self.scheduler_fine = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer_fine, patience=50, factor=0.5
+        self.scheduler_fine_gaussian = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_fine_gaussian, patience=50, factor=0.5
+        )
+        self.scheduler_fine_mlp = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_fine_mlp, patience=50, factor=0.5
         )
 
     def compute_loss(self, pred, target, coarse_output=None):
@@ -507,9 +582,11 @@ class MBDSolver3D:
         # 3. Regularization: prevent scale explosion
         coeff_s = torch.exp(self.model.coeff_log_s)
         basis_s = torch.exp(self.model.basis_log_s)
+        fine_s = torch.exp(self.model.fine_log_s)
         reg_loss = self.lambda_reg * (
             torch.sum(self.model.C ** 2) +
-            torch.sum(coeff_s ** 2) + torch.sum(basis_s ** 2)
+            torch.sum(coeff_s ** 2) + torch.sum(basis_s ** 2) +
+            0.5 * torch.sum(fine_s ** 2)  # Smaller regularization for fine (want small scales)
         )
         
         # 4. Gate regularization: encourage diversity (not all 0 or all 1)
@@ -529,12 +606,13 @@ class MBDSolver3D:
         Stages:
             'coarse': Focus on MBD branch (higher λ_coarse)
             'main': Train all branches jointly
-            'fine': Fine-tune with focus on fine branch (lower λ_coarse)
+            'fine': Fine-tune with focus on fine branch (Gaussian + MLP)
         """
         # Zero gradients for all optimizers
-        self.optimizer_gaussian.zero_grad()
+        self.optimizer_coarse_gaussian.zero_grad()
         self.optimizer_mbd.zero_grad()
-        self.optimizer_fine.zero_grad()
+        self.optimizer_fine_gaussian.zero_grad()
+        self.optimizer_fine_mlp.zero_grad()
         self.optimizer_gate.zero_grad()
         self.optimizer_refiner.zero_grad()
 
@@ -549,7 +627,13 @@ class MBDSolver3D:
         # Gate diversity regularization
         # Encourage gate to have variance (not stuck at 0 or 1)
         with torch.no_grad():
-            gate_values = self.model.gate_network(coords_batch)
+            # Get fine weights for gate input
+            fine_weights = self.model.compute_gaussian_weights_3d(
+                coords_batch, self.model.fine_mu, self.model.fine_log_s, 
+                self.model.fine_q, self.model.fine_alpha
+            )
+            gate_input = torch.cat([coords_batch, fine_weights], dim=-1)
+            gate_values = self.model.gate_network(gate_input)
             gate_mean = gate_values.mean().item()
             gate_std = gate_values.std().item()
 
@@ -562,18 +646,20 @@ class MBDSolver3D:
         # Optimization based on stage
         if stage == 'coarse':
             # Focus on coarse branch
-            self.optimizer_gaussian.step()
+            self.optimizer_coarse_gaussian.step()
             self.optimizer_mbd.step()
         elif stage == 'fine':
-            # Focus on fine branch
-            self.optimizer_fine.step()
+            # Focus on fine branch (Gaussian + MLP)
+            self.optimizer_fine_gaussian.step()
+            self.optimizer_fine_mlp.step()
             self.optimizer_gate.step()
             self.optimizer_refiner.step()
         else:  # 'main'
             # Train all branches
-            self.optimizer_gaussian.step()
+            self.optimizer_coarse_gaussian.step()
             self.optimizer_mbd.step()
-            self.optimizer_fine.step()
+            self.optimizer_fine_gaussian.step()
+            self.optimizer_fine_mlp.step()
             self.optimizer_gate.step()
             self.optimizer_refiner.step()
 
@@ -603,15 +689,15 @@ class MBDSolver3D:
         
         Stage 1 (Coarse Focus): Train MBD to capture low-frequency structure
             - High λ_coarse weight
-            - Only update Gaussian and MBD parameters
+            - Only update Coarse Gaussian and MBD parameters
             
         Stage 2 (Joint Training): Train all branches together
             - Gradually decrease λ_coarse
-            - Update all parameters
+            - Update all parameters (including Fine Gaussians)
             
         Stage 3 (Fine Focus): Refine high-frequency details
             - Low λ_coarse weight
-            - Focus on fine branch and gate
+            - Focus on Fine Gaussians + MLP + Gate
         """
         losses = []
         num_samples = coords.shape[0]
@@ -619,10 +705,11 @@ class MBDSolver3D:
         
         print(f"="*60)
         print(f"Hierarchical Training Strategy (Coarse-to-Fine)")
+        print(f"  with Gaussian-Guided Fine Branch")
         print(f"="*60)
         print(f"  Stage 1 (Coarse): {epochs_coarse} epochs - MBD focus")
         print(f"  Stage 2 (Joint):  {epochs_main} epochs - All branches")
-        print(f"  Stage 3 (Fine):   {epochs_fine} epochs - Detail refinement")
+        print(f"  Stage 3 (Fine):   {epochs_fine} epochs - Gaussian+MLP detail refinement")
         print(f"  Total: {total_epochs} epochs, batch_size={batch_size}")
         print(f"="*60)
         
@@ -639,7 +726,7 @@ class MBDSolver3D:
             losses.append(loss_dict)
 
             if epoch % 100 == 0:
-                self.scheduler_gaussian.step(loss_dict['total_loss'])
+                self.scheduler_coarse_gaussian.step(loss_dict['total_loss'])
                 self.scheduler_mbd.step(loss_dict['total_loss'])
 
             if epoch % 200 == 0 or epoch == epochs_coarse - 1:
@@ -650,6 +737,7 @@ class MBDSolver3D:
 
         # ============ Stage 2: Joint Training ============
         print(f"\n[Stage 2] Joint Training ({epochs_main} epochs)...")
+        print(f"  Training Fine Gaussians to locate high-frequency regions...")
         
         for epoch in range(epochs_main):
             # Gradually decrease λ_coarse (curriculum learning)
@@ -664,9 +752,10 @@ class MBDSolver3D:
             losses.append(loss_dict)
 
             if epoch % 100 == 0:
-                self.scheduler_gaussian.step(loss_dict['total_loss'])
+                self.scheduler_coarse_gaussian.step(loss_dict['total_loss'])
                 self.scheduler_mbd.step(loss_dict['total_loss'])
-                self.scheduler_fine.step(loss_dict['total_loss'])
+                self.scheduler_fine_gaussian.step(loss_dict['total_loss'])
+                self.scheduler_fine_mlp.step(loss_dict['total_loss'])
 
             if epoch % 300 == 0 or epoch == epochs_main - 1:
                 print(f"  Epoch {epoch:4d}/{epochs_main} | "
@@ -678,6 +767,7 @@ class MBDSolver3D:
 
         # ============ Stage 3: Fine Focus ============
         print(f"\n[Stage 3] Fine Focus Training ({epochs_fine} epochs)...")
+        print(f"  Refining Fine Gaussians + MLP for high-frequency details...")
         self.lambda_coarse = 0.1  # Low weight on coarse
         
         for epoch in range(epochs_fine):
@@ -697,28 +787,32 @@ class MBDSolver3D:
         print(f"\n[Training Complete] Total epochs: {len(losses)}")
         return losses
 
-# ==================== Hierarchical MBD + MLP with Coarse-to-Fine Decoding ====================
-# Create model with hierarchical architecture
+# ==================== Hierarchical MBD + Gaussian + MLP with Coarse-to-Fine Decoding ====================
+# Create model with hierarchical architecture (NEW: Gaussian-Guided Fine Branch)
 model = MBDCompressor3D(
     num_bases=8,              # Number of bases L
-    coeff_res=32,             # Coefficient 3D Gaussians M
-    basis_res=32,             # Basis 3D Gaussians N
+    coeff_res=32,             # Coefficient 3D Gaussians M (Coarse)
+    basis_res=32,             # Basis 3D Gaussians N (Coarse)
     data_dim=C,               # Data dimension D (RGB)
-    coeff_kernel_scale=0.15,  # Initial scale
-    basis_kernel_scale=0.20,  # Initial scale
+    coeff_kernel_scale=0.15,  # Initial scale (Coarse - large)
+    basis_kernel_scale=0.20,  # Initial scale (Coarse - large)
     mlp_hidden=48,            # MLP hidden size
     pe_num_freqs=4,           # Positional encoding frequencies
-    fine_mlp_depth=2          # Fine branch MLP depth
+    fine_mlp_depth=2,         # Fine branch MLP depth
+    fine_gaussian_res=16,     # Fine Gaussians F (small, sparse anchors)
+    fine_kernel_scale=0.08    # Fine Gaussian scale (small for local detail)
 )
 
 # Print detailed architecture info
 branch_info = model.get_branch_info()
 print(f"\nModel Parameter Distribution:")
-print(f"  Coarse (MBD):     {branch_info['coarse_mbd']:6d} params")
-print(f"  Fine (MLP+PE):    {branch_info['fine_mlp']:6d} params")
-print(f"  Gate Network:     {branch_info['gate_network']:6d} params")
-print(f"  Residual Refiner: {branch_info['residual_refiner']:6d} params")
-print(f"  Total:            {branch_info['total']:6d} params")
+print(f"  Coarse (MBD):       {branch_info['coarse_mbd']:6d} params")
+print(f"  Fine (Gaussian):    {branch_info['fine_gaussian']:6d} params")
+print(f"  Fine (MLP):         {branch_info['fine_mlp']:6d} params")
+print(f"  Fine (Total):       {branch_info['fine_total']:6d} params")
+print(f"  Gate Network:       {branch_info['gate_network']:6d} params")
+print(f"  Residual Refiner:   {branch_info['residual_refiner']:6d} params")
+print(f"  Total:              {branch_info['total']:6d} params")
 
 # Create solver with hierarchical training strategy
 solver = MBDSolver3D(model, lambda_reg=1e-5, lambda_coarse=0.5)
@@ -866,7 +960,7 @@ print(f"  Avg PSNR: {psnr_value:.2f} dB")
 print(f"  Avg SSIM: {ssim_value:.4f}")
 print(f"  Final loss: {losses[-1]['total_loss']:.6f}")
 
-# ==================== Visualization results (Hierarchical Decoding) ====================
+# ==================== Visualization results (Hierarchical Decoding with Gaussian-Guided Fine) ====================
 print("\nGenerating Hierarchical Visualization results...")
 
 # Get middle slice for visualization
@@ -876,11 +970,11 @@ coarse_slice = coarse_vol[z_slice, :, :, :]        # [H, W, C]
 fine_slice = fine_vol[z_slice, :, :, :]            # [H, W, C]
 gate_slice = gate_vol[z_slice, :, :]               # [H, W]
 
-fig = plt.figure(figsize=(24, 16))
+fig = plt.figure(figsize=(28, 16))
 
-# Row 1: Original, Final, Coarse, Fine
+# Row 1: Original, Final, Coarse, Fine, Fine Gaussian Positions
 # 1. Original signal
-ax1 = plt.subplot(3, 4, 1)
+ax1 = plt.subplot(3, 5, 1)
 im1 = ax1.imshow(gt_slice, vmin=0, vmax=1)
 ax1.set_title(f'Ground Truth (Z={z_slice})\n{D}x{H}x{W}x{C}')
 ax1.set_xlabel('X')
@@ -888,7 +982,7 @@ ax1.set_ylabel('Y')
 ax1.grid(False)
 
 # 2. Final reconstruction (Coarse + Fine blended)
-ax2 = plt.subplot(3, 4, 2)
+ax2 = plt.subplot(3, 5, 2)
 im2 = ax2.imshow(rec_slice, vmin=0, vmax=1)
 ax2.set_title(f'Final Output (Blended)\nPSNR: {psnr_value:.1f}dB, Ratio: {comp_ratio:.1f}:1')
 ax2.set_xlabel('X')
@@ -896,145 +990,177 @@ ax2.grid(False)
 
 # 3. Coarse branch output (MBD only)
 coarse_psnr = compute_psnr(gt_slice.mean(axis=-1), coarse_slice.mean(axis=-1))
-ax3 = plt.subplot(3, 4, 3)
+ax3 = plt.subplot(3, 5, 3)
 im3 = ax3.imshow(coarse_slice, vmin=0, vmax=1)
 ax3.set_title(f'Coarse Branch (MBD)\nPSNR: {coarse_psnr:.1f}dB')
 ax3.set_xlabel('X')
 ax3.grid(False)
 
-# 4. Fine branch output (MLP only)
+# 4. Fine branch output (Gaussian + MLP)
 fine_psnr = compute_psnr(gt_slice.mean(axis=-1), fine_slice.mean(axis=-1))
-ax4 = plt.subplot(3, 4, 4)
+ax4 = plt.subplot(3, 5, 4)
 im4 = ax4.imshow(fine_slice, vmin=0, vmax=1)
-ax4.set_title(f'Fine Branch (MLP+PE)\nPSNR: {fine_psnr:.1f}dB')
+ax4.set_title(f'Fine Branch (Gauss+MLP)\nPSNR: {fine_psnr:.1f}dB')
 ax4.set_xlabel('X')
 ax4.grid(False)
 
-# Row 2: Error maps and Gate visualization
-# 5. Final error map
-ax5 = plt.subplot(3, 4, 5)
-error = np.abs(gt_slice - rec_slice)
-error_img = ax5.imshow(error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
-ax5.set_title(f'Final Error\nSSIM: {ssim_value:.4f}')
+# 5. Fine Gaussian positions overlay on error map
+ax5 = plt.subplot(3, 5, 5)
+error_for_overlay = np.abs(gt_slice - coarse_slice).mean(axis=-1)
+ax5.imshow(error_for_overlay, cmap='hot', vmin=0, vmax=0.15)
+# Overlay Fine Gaussian positions (projected to Z slice)
+gaussian_params = model.get_gaussian_params()
+fine_mu = gaussian_params['fine_mu']
+fine_s = gaussian_params['fine_s']
+fine_alpha = gaussian_params['fine_alpha']
+# Filter gaussians near this Z slice
+z_tolerance = 0.15
+near_slice_mask = np.abs(fine_mu[:, 2] - z_slice / D) < z_tolerance
+for i in range(len(fine_mu)):
+    if near_slice_mask[i]:
+        x_pos = fine_mu[i, 0] * W
+        y_pos = fine_mu[i, 1] * H
+        size = np.mean(fine_s[i]) * 500 * fine_alpha[i]
+        ax5.scatter(x_pos, y_pos, s=size, c='cyan', alpha=0.7, edgecolors='white', linewidths=1)
+ax5.set_title(f'Fine Gaussians on Coarse Error\n{near_slice_mask.sum()}/{len(fine_mu)} near Z={z_slice}')
 ax5.set_xlabel('X')
-plt.colorbar(error_img, ax=ax5, fraction=0.046, pad=0.04)
 ax5.grid(False)
 
-# 6. Coarse error map
-ax6 = plt.subplot(3, 4, 6)
-coarse_error = np.abs(gt_slice - coarse_slice)
-coarse_error_img = ax6.imshow(coarse_error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
-ax6.set_title('Coarse Branch Error')
+# Row 2: Error maps and Gate visualization
+# 6. Final error map
+ax6 = plt.subplot(3, 5, 6)
+error = np.abs(gt_slice - rec_slice)
+error_img = ax6.imshow(error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
+ax6.set_title(f'Final Error\nSSIM: {ssim_value:.4f}')
 ax6.set_xlabel('X')
-plt.colorbar(coarse_error_img, ax=ax6, fraction=0.046, pad=0.04)
+plt.colorbar(error_img, ax=ax6, fraction=0.046, pad=0.04)
 ax6.grid(False)
 
-# 7. Gate weight visualization (shows where fine branch is used more)
-ax7 = plt.subplot(3, 4, 7)
-gate_img = ax7.imshow(gate_slice, cmap='RdYlBu_r', vmin=0, vmax=1)
-ax7.set_title(f'Gate Weights\n0=Coarse, 1=Fine\nMean: {gate_slice.mean():.3f}')
+# 7. Coarse error map
+ax7 = plt.subplot(3, 5, 7)
+coarse_error = np.abs(gt_slice - coarse_slice)
+coarse_error_img = ax7.imshow(coarse_error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
+ax7.set_title('Coarse Branch Error')
 ax7.set_xlabel('X')
-plt.colorbar(gate_img, ax=ax7, fraction=0.046, pad=0.04)
+plt.colorbar(coarse_error_img, ax=ax7, fraction=0.046, pad=0.04)
 ax7.grid(False)
 
-# 8. Gate histogram
-ax8 = plt.subplot(3, 4, 8)
-ax8.hist(gate_vol.flatten(), bins=50, alpha=0.7, color='steelblue', edgecolor='black')
-ax8.axvline(x=gate_vol.mean(), color='red', linestyle='--', linewidth=2,
+# 8. Gate weight visualization
+ax8 = plt.subplot(3, 5, 8)
+gate_img = ax8.imshow(gate_slice, cmap='RdYlBu_r', vmin=0, vmax=1)
+ax8.set_title(f'Gate Weights\n0=Coarse, 1=Fine\nMean: {gate_slice.mean():.3f}')
+ax8.set_xlabel('X')
+plt.colorbar(gate_img, ax=ax8, fraction=0.046, pad=0.04)
+ax8.grid(False)
+
+# 9. Gate histogram
+ax9 = plt.subplot(3, 5, 9)
+ax9.hist(gate_vol.flatten(), bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+ax9.axvline(x=gate_vol.mean(), color='red', linestyle='--', linewidth=2,
             label=f'Mean: {gate_vol.mean():.3f}')
-ax8.set_title('Gate Distribution (All Voxels)')
-ax8.set_xlabel('Gate Value')
-ax8.set_ylabel('Count')
-ax8.legend()
-ax8.grid(True, alpha=0.3)
+ax9.set_title('Gate Distribution (All Voxels)')
+ax9.set_xlabel('Gate Value')
+ax9.set_ylabel('Count')
+ax9.legend()
+ax9.grid(True, alpha=0.3)
+
+# 10. Fine Gaussian alpha distribution
+ax10 = plt.subplot(3, 5, 10)
+ax10.bar(range(len(fine_alpha)), fine_alpha, color='cyan', edgecolor='black', alpha=0.7)
+ax10.axhline(y=fine_alpha.mean(), color='red', linestyle='--', linewidth=2,
+             label=f'Mean: {fine_alpha.mean():.3f}')
+ax10.set_title('Fine Gaussian Importance (α)')
+ax10.set_xlabel('Gaussian Index')
+ax10.set_ylabel('Alpha (Importance)')
+ax10.legend()
+ax10.grid(True, alpha=0.3)
 
 # Row 3: Training curves and statistics
-# 9. Training loss curves
-ax9 = plt.subplot(3, 4, 9)
+# 11. Training loss curves
+ax11 = plt.subplot(3, 5, 11)
 total_losses = [l['total_loss'] for l in losses]
 final_losses = [l['final_loss'] for l in losses]
 coarse_losses = [l['coarse_loss'] for l in losses]
 
-ax9.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
-ax9.semilogy(final_losses, 'g--', linewidth=1.5, alpha=0.7, label='Final Loss')
-ax9.semilogy(coarse_losses, 'r:', linewidth=1.5, alpha=0.7, label='Coarse Loss')
+ax11.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
+ax11.semilogy(final_losses, 'g--', linewidth=1.5, alpha=0.7, label='Final Loss')
+ax11.semilogy(coarse_losses, 'r:', linewidth=1.5, alpha=0.7, label='Coarse Loss')
 
 # Mark training stages
 epochs_coarse, epochs_main, epochs_fine = 400, 1600, 500
-ax9.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7, label='Stage 1→2')
-ax9.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7, label='Stage 2→3')
-ax9.set_title('Training Loss (3 Stages)')
-ax9.set_xlabel('Iterations')
-ax9.set_ylabel('Loss Value')
-ax9.legend(fontsize='x-small', loc='upper right')
-ax9.grid(True, alpha=0.3)
+ax11.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7, label='Stage 1→2')
+ax11.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7, label='Stage 2→3')
+ax11.set_title('Training Loss (3 Stages)')
+ax11.set_xlabel('Iterations')
+ax11.set_ylabel('Loss Value')
+ax11.legend(fontsize='x-small', loc='upper right')
+ax11.grid(True, alpha=0.3)
 
-# 10. Gate evolution during training
-ax10 = plt.subplot(3, 4, 10)
+# 12. Gate evolution during training
+ax12 = plt.subplot(3, 5, 12)
 gate_means = [l['gate_mean'] for l in losses]
 gate_stds = [l['gate_std'] for l in losses]
 epochs_arr = np.arange(len(gate_means))
 
-ax10.plot(gate_means, 'b-', linewidth=2, label='Gate Mean')
-ax10.fill_between(epochs_arr, 
+ax12.plot(gate_means, 'b-', linewidth=2, label='Gate Mean')
+ax12.fill_between(epochs_arr, 
                    np.array(gate_means) - np.array(gate_stds),
                    np.array(gate_means) + np.array(gate_stds),
                    alpha=0.3, color='blue', label='±1 Std')
-ax10.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7)
-ax10.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7)
-ax10.set_title('Gate Weight Evolution')
-ax10.set_xlabel('Iterations')
-ax10.set_ylabel('Gate Value')
-ax10.set_ylim(0, 1)
-ax10.legend(fontsize='small')
-ax10.grid(True, alpha=0.3)
+ax12.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7)
+ax12.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7)
+ax12.set_title('Gate Weight Evolution')
+ax12.set_xlabel('Iterations')
+ax12.set_ylabel('Gate Value')
+ax12.set_ylim(0, 1)
+ax12.legend(fontsize='small')
+ax12.grid(True, alpha=0.3)
 
-# 11. Channel comparison (1D line)
-ax11 = plt.subplot(3, 4, 11)
+# 13. Channel comparison (1D line)
+ax13 = plt.subplot(3, 5, 13)
 y_line = H // 2
 channel_colors = ['#E74C3C', '#27AE60', '#3498DB']
 channel_names = ['R', 'G', 'B']
 
 for c in range(C):
-    ax11.plot(gt_slice[y_line, :, c],
+    ax13.plot(gt_slice[y_line, :, c],
               color=channel_colors[c], linestyle='-', alpha=0.6, linewidth=1.5,
               label=f'GT {channel_names[c]}')
-    ax11.plot(rec_slice[y_line, :, c],
+    ax13.plot(rec_slice[y_line, :, c],
               color=channel_colors[c], linestyle='--', alpha=0.9, linewidth=1.5,
               label=f'Pred {channel_names[c]}')
 
-ax11.set_title(f'1D Fitting (Z={z_slice}, Y={y_line})')
-ax11.set_xlabel('X Coordinate')
-ax11.set_ylabel('Value')
-ax11.legend(loc='upper right', fontsize='x-small', ncol=2)
-ax11.grid(True, alpha=0.3)
+ax13.set_title(f'1D Fitting (Z={z_slice}, Y={y_line})')
+ax13.set_xlabel('X Coordinate')
+ax13.set_ylabel('Value')
+ax13.legend(loc='upper right', fontsize='x-small', ncol=2)
+ax13.grid(True, alpha=0.3)
 
-# 12. Summary information
-ax12 = plt.subplot(3, 4, 12)
-ax12.axis('off')
+# 14. Fine Gaussian scale distribution
+ax14 = plt.subplot(3, 5, 14)
+fine_s_mean = fine_s.mean(axis=1)
+coeff_s = gaussian_params['coeff_s']
+coeff_s_mean = coeff_s.mean(axis=1)
+ax14.hist(coeff_s_mean, bins=15, alpha=0.6, color='blue', label=f'Coarse (M={model.M})', edgecolor='black')
+ax14.hist(fine_s_mean, bins=15, alpha=0.6, color='cyan', label=f'Fine (F={model.F})', edgecolor='black')
+ax14.set_title('Gaussian Scale Distribution')
+ax14.set_xlabel('Mean Scale')
+ax14.set_ylabel('Count')
+ax14.legend()
+ax14.grid(True, alpha=0.3)
+
+# 15. Summary information
+ax15 = plt.subplot(3, 5, 15)
+ax15.axis('off')
 num_probes = D * H * W
 
-# Get Gaussian stats
-gaussian_params = model.get_gaussian_params()
-coeff_s = gaussian_params['coeff_s']
-basis_s = gaussian_params['basis_s']
-coeff_q = gaussian_params['coeff_q']
-basis_q = gaussian_params['basis_q']
 coeff_alpha = gaussian_params['coeff_alpha']
 basis_alpha = gaussian_params['basis_alpha']
 mbd_scale = gaussian_params['mbd_scale']
 
-coeff_scale_ratios = coeff_s.max(axis=1) / (coeff_s.min(axis=1) + 1e-8)
-basis_scale_ratios = basis_s.max(axis=1) / (basis_s.min(axis=1) + 1e-8)
-
-coeff_q_norm = coeff_q / (np.linalg.norm(coeff_q, axis=1, keepdims=True) + 1e-8)
-basis_q_norm = basis_q / (np.linalg.norm(basis_q, axis=1, keepdims=True) + 1e-8)
-coeff_angles = 2 * np.arccos(np.clip(coeff_q_norm[:, 0], -1, 1)) * 180 / np.pi
-basis_angles = 2 * np.arccos(np.clip(basis_q_norm[:, 0], -1, 1)) * 180 / np.pi
-
 info_text = f"""
-Hierarchical MBD (Coarse-to-Fine) Summary
-==========================================
+Hierarchical MBD + Gaussian-Guided Fine Branch
+===============================================
 Original Data:
   Volume: {D}x{H}x{W}x{C} = {num_probes} points
   Size: {original_size/1024:.1f} KB
@@ -1042,36 +1168,36 @@ Original Data:
 Model Architecture:
   Coarse (MBD): M={model.M}, N={model.N}, L={model.L}
   MBD Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]
-  Fine (MLP):   PE({model.pe_num_freqs}) + {model.mlp_hidden}h
+  Fine (Gaussian): F={model.F} anchors
+  Fine (MLP): PE({model.pe_num_freqs}) + {model.mlp_hidden}h
   Total params: {branch_info['total']}
 
 Compression (float16 quantized):
   FP32 Size: {comp_size_fp32/1024:.1f} KB ({comp_ratio_fp32:.1f}:1)
   FP16 Size: {comp_size_fp16/1024:.1f} KB ({comp_ratio_fp16:.1f}:1)
 
-Alpha Statistics:
-  Coeff Alpha: {coeff_alpha.mean():.3f} ± {coeff_alpha.std():.3f}
-  Basis Alpha: {basis_alpha.mean():.3f} ± {basis_alpha.std():.3f}
+Fine Gaussian Statistics:
+  Alpha: {fine_alpha.mean():.3f} ± {fine_alpha.std():.3f}
+  Scale: {fine_s_mean.mean():.4f} ± {fine_s_mean.std():.4f}
 
 Gate Statistics:
   Mean: {gate_vol.mean():.3f} ± {gate_vol.std():.3f}
-  Min: {gate_vol.min():.3f}, Max: {gate_vol.max():.3f}
 
 Reconstruction Quality:
   Final PSNR: {psnr_value:.1f} dB
   Final SSIM: {ssim_value:.4f}
   Coarse PSNR: {coarse_psnr:.1f} dB
 """
-ax12.text(0.02, 0.5, info_text, fontsize=8,
+ax15.text(0.02, 0.5, info_text, fontsize=8,
           family='monospace', verticalalignment='center')
 
-plt.suptitle('Hierarchical MBD with Coarse-to-Fine Decoding', fontsize=16, y=1.01)
+plt.suptitle('Hierarchical MBD with Gaussian-Guided Fine Branch (Coarse-to-Fine)', fontsize=16, y=1.01)
 plt.tight_layout()
 plt.show()
 
 print("\nDemo completed!")
 print("="*70)
-print("Hierarchical MBD with Coarse-to-Fine Decoding")
+print("Hierarchical MBD with Gaussian-Guided Fine Branch")
 print("="*70)
 print(f"Architecture:")
 print(f"  [Coarse Branch] MBD with 3D Gaussians")
@@ -1079,15 +1205,18 @@ print(f"    - Coefficient Gaussians: M={model.M} (position + scale + rotation + 
 print(f"    - Basis Gaussians: N={model.N} (position + scale + rotation + alpha)")
 print(f"    - Number of Bases: L={model.L}")
 print(f"    - MBD Learnable Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]")
-print(f"  [Fine Branch] MLP with Positional Encoding")
+print(f"  [Fine Branch] Gaussian-Guided MLP")
+print(f"    - Fine Gaussians: F={model.F} (small-scale anchors)")
+print(f"    - Fine Gaussian Scale: {fine_s_mean.mean():.4f} (mean)")
+print(f"    - Fine Gaussian Alpha: {fine_alpha.mean():.3f} \u00b1 {fine_alpha.std():.3f}")
 print(f"    - PE frequencies: {model.pe_num_freqs}")
 print(f"    - Hidden size: {model.mlp_hidden}")
-print(f"  [Gate Network] Adaptive blending")
-print(f"    - Learned position-dependent weights")
+print(f"  [Gate Network] Gaussian-aware adaptive blending")
+print(f"    - Input: 3D position + Fine Gaussian weights")
 print(f"\nTraining Strategy (3 Stages):")
 print(f"  Stage 1: {epochs_coarse} epochs - Focus on Coarse (MBD)")
 print(f"  Stage 2: {epochs_main} epochs - Joint training (all branches)")
-print(f"  Stage 3: {epochs_fine} epochs - Focus on Fine (details)")
+print(f"  Stage 3: {epochs_fine} epochs - Focus on Fine (Gaussian+MLP)")
 print(f"\nResults:")
 print(f"  Compression (FP32): {comp_ratio_fp32:.1f}:1 ({comp_size_fp32/1024:.2f} KB)")
 print(f"  Compression (FP16): {comp_ratio_fp16:.1f}:1 ({comp_size_fp16/1024:.2f} KB)")
@@ -1095,14 +1224,15 @@ print(f"  Final PSNR: {psnr_value:.1f} dB")
 print(f"  Final SSIM: {ssim_value:.4f}")
 print(f"  Coarse-only PSNR: {coarse_psnr:.1f} dB")
 print(f"  Gate Mean: {gate_vol.mean():.3f} (0=Coarse, 1=Fine)")
-print(f"  Coeff Alpha: {coeff_alpha.mean():.3f} ± {coeff_alpha.std():.3f}")
-print(f"  Basis Alpha: {basis_alpha.mean():.3f} ± {basis_alpha.std():.3f}")
+print(f"  Coeff Alpha: {coeff_alpha.mean():.3f} \u00b1 {coeff_alpha.std():.3f}")
+print(f"  Basis Alpha: {basis_alpha.mean():.3f} \u00b1 {basis_alpha.std():.3f}")
 print(f"\nKey Innovations:")
-print(f"  1. Hierarchical decoding: MBD for low-freq + MLP for high-freq")
-print(f"  2. Learnable Alpha: Intensity parameters for Gaussian weighting")
-print(f"  3. MBD Learnable Scale: Per-basis scale factors")
-print(f"  4. Positional Encoding: Better high-frequency learning")
-print(f"  5. Adaptive Gate: Position-dependent branch selection")
-print(f"  6. Intermediate Supervision: Coarse branch also supervised")
-print(f"  7. Curriculum Learning: λ_coarse decay during training")
+print(f"  1. Hierarchical decoding: MBD for low-freq + Gaussian+MLP for high-freq")
+print(f"  2. Fine Gaussians: Sparse anchors that learn high-frequency regions")
+print(f"  3. Gaussian-Guided MLP: Spatial awareness for local detail capture")
+print(f"  4. MBD Learnable Scale: Per-basis scale factors")
+print(f"  5. Positional Encoding: Better high-frequency learning")
+print(f"  6. Gaussian-aware Gate: Fine Gaussian weights inform gating")
+print(f"  7. Intermediate Supervision: Coarse branch also supervised")
+print(f"  8. Curriculum Learning: \u03bb_coarse decay during training")
 print("="*70)
