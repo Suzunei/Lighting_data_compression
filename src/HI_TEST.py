@@ -70,7 +70,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # Generate 3D test signal
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = get_test_signal_by_name("forest_dappled", grid_size=32, num_channels=3)
+ground_truth = get_test_signal_by_name("neon", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
@@ -799,7 +799,7 @@ model = MBDCompressor3D(
     mlp_hidden=48,            # MLP hidden size
     pe_num_freqs=4,           # Positional encoding frequencies
     fine_mlp_depth=2,         # Fine branch MLP depth
-    fine_gaussian_res=16,     # Fine Gaussians F (small, sparse anchors)
+    fine_gaussian_res=8,     # Fine Gaussians F (small, sparse anchors)
     fine_kernel_scale=0.08    # Fine Gaussian scale (small for local detail)
 )
 
@@ -1064,16 +1064,79 @@ ax9.set_ylabel('Count')
 ax9.legend()
 ax9.grid(True, alpha=0.3)
 
-# 10. Fine Gaussian alpha distribution
-ax10 = plt.subplot(3, 5, 10)
-ax10.bar(range(len(fine_alpha)), fine_alpha, color='cyan', edgecolor='black', alpha=0.7)
-ax10.axhline(y=fine_alpha.mean(), color='red', linestyle='--', linewidth=2,
-             label=f'Mean: {fine_alpha.mean():.3f}')
-ax10.set_title('Fine Gaussian Importance (α)')
-ax10.set_xlabel('Gaussian Index')
-ax10.set_ylabel('Alpha (Importance)')
-ax10.legend()
-ax10.grid(True, alpha=0.3)
+# 10. 3D Gaussian Transform Visualization (Ellipsoids)
+ax10 = fig.add_subplot(3, 5, 10, projection='3d')
+
+# Retrieve all gaussian params for 3D visualization
+coeff_q_viz = gaussian_params['coeff_q']
+basis_mu_viz = gaussian_params['basis_mu']
+basis_s_viz = gaussian_params['basis_s']
+basis_q_viz = gaussian_params['basis_q']
+fine_q_viz = gaussian_params['fine_q']
+
+def draw_ellipsoid(ax, center, scale, quaternion, n_points=12, alpha=0.1, color='blue'):
+    """Draw ellipsoid in 3D to represent Gaussian covariance shape"""
+    u = np.linspace(0, 2 * np.pi, n_points)
+    v = np.linspace(0, np.pi, n_points // 2)
+    x = np.outer(np.cos(u), np.sin(v))
+    y = np.outer(np.sin(u), np.sin(v))
+    z = np.outer(np.ones(np.size(u)), np.cos(v))
+    # Apply scale
+    x = x * scale[0]
+    y = y * scale[1]
+    z = z * scale[2]
+    # Quaternion to rotation matrix
+    q_norm = quaternion / (np.linalg.norm(quaternion) + 1e-8)
+    w_q, x_q, y_q, z_q = q_norm
+    R = np.array([
+        [1 - 2*y_q*y_q - 2*z_q*z_q, 2*x_q*y_q - 2*w_q*z_q, 2*x_q*z_q + 2*w_q*y_q],
+        [2*x_q*y_q + 2*w_q*z_q, 1 - 2*x_q*x_q - 2*z_q*z_q, 2*y_q*z_q - 2*w_q*x_q],
+        [2*x_q*z_q - 2*w_q*y_q, 2*y_q*z_q + 2*w_q*x_q, 1 - 2*x_q*x_q - 2*y_q*y_q]
+    ])
+    points = np.array([x.flatten(), y.flatten(), z.flatten()])
+    rotated_points = R @ points
+    x_rot = rotated_points[0, :].reshape(x.shape) + center[0]
+    y_rot = rotated_points[1, :].reshape(y.shape) + center[1]
+    z_rot = rotated_points[2, :].reshape(z.shape) + center[2]
+    ax.plot_surface(x_rot, y_rot, z_rot, alpha=alpha, color=color, linewidth=0)
+
+# Draw gaussian center points
+coeff_mu_viz = gaussian_params['coeff_mu']
+coeff_s_viz = gaussian_params['coeff_s']
+basis_mu_viz_pts = gaussian_params['basis_mu']
+basis_s_viz_pts = gaussian_params['basis_s']
+
+ax10.scatter(coeff_mu_viz[:, 0], coeff_mu_viz[:, 1], coeff_mu_viz[:, 2],
+            c='red', s=20, alpha=0.7, label=f'Coeff (M={model.M})')
+ax10.scatter(basis_mu_viz_pts[:, 0], basis_mu_viz_pts[:, 1], basis_mu_viz_pts[:, 2],
+            c='blue', s=25, marker='s', alpha=0.7, label=f'Basis (N={model.N})')
+ax10.scatter(fine_mu[:, 0], fine_mu[:, 1], fine_mu[:, 2],
+            c='cyan', s=15, marker='^', alpha=0.7, label=f'Fine (F={model.F})')
+
+# Draw ellipsoids for coeff gaussians
+num_show = min(32, model.M)
+indices_coeff = np.linspace(0, model.M - 1, num_show, dtype=int)
+for idx in indices_coeff:
+    draw_ellipsoid(ax10, coeff_mu_viz[idx], coeff_s_viz[idx], coeff_q_viz[idx], color='red', alpha=0.06)
+
+# Draw ellipsoids for basis gaussians
+num_show_b = min(32, model.N)
+indices_basis = np.linspace(0, model.N - 1, num_show_b, dtype=int)
+for idx in indices_basis:
+    draw_ellipsoid(ax10, basis_mu_viz_pts[idx], basis_s_viz_pts[idx], basis_q_viz[idx], color='blue', alpha=0.06)
+
+# Draw ellipsoids for fine gaussians
+for idx in range(model.F):
+    draw_ellipsoid(ax10, fine_mu[idx], fine_s[idx], fine_q_viz[idx], color='cyan', alpha=0.10)
+
+ax10.set_xlim(0, 1)
+ax10.set_ylim(0, 1)
+ax10.set_zlim(0, 1)
+ax10.set_title(f'3D Gaussian Ellipsoids\nM={model.M}, N={model.N}, F={model.F}')
+ax10.set_xlabel('X')
+ax10.set_ylabel('Y')
+ax10.set_zlabel('Z')
+ax10.legend(fontsize='xx-small', loc='upper left')
 
 # Row 3: Training curves and statistics
 # 11. Training loss curves
