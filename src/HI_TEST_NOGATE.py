@@ -126,9 +126,8 @@ class MBDCompressor3D(nn.Module):
             φ_fine(x) = Gaussian weights from fine anchors
             f_fine(x) = MLP(PE(x), φ_fine(x)) - Gaussian-guided high-freq learning
         
-        Adaptive Gate: Position-dependent fusion
-            gate(x) = σ(MLP_gate(x))
-            f_final(x) = (1 - gate) * f_coarse + gate * f_fine
+        Adaptive Blending: Additive residual fusion
+            f_final(x) = f_coarse(x) + f_fine(x)
     
     Key Innovation: Hierarchical decoding with Gaussian-guided Fine Branch:
         - MBD (large Gaussians): smooth, low-frequency components (compression)
@@ -193,7 +192,8 @@ class MBDCompressor3D(nn.Module):
         # Intensity/opacity alpha: [F] - learnable importance for each fine gaussian
         self.fine_alpha = nn.Parameter(torch.zeros(fine_gaussian_res))
         # Fine feature vectors: [F, D] - learnable features at each fine anchor
-        self.fine_features = nn.Parameter(torch.randn(fine_gaussian_res, data_dim) * 0.1)
+        # Small init for additive residual: fine branch starts near zero
+        self.fine_features = nn.Parameter(torch.randn(fine_gaussian_res, data_dim) * 0.01)
 
         # ========== MBD Coefficient/Basis Tensors ==========
         # C: [M, L] - scalar coefficients at coefficient control points
@@ -224,8 +224,15 @@ class MBDCompressor3D(nn.Module):
         fine_layers.append(nn.Linear(mlp_hidden, data_dim))
         self.fine_mlp = nn.Sequential(*fine_layers)
 
-        # ========== No Gate: Direct Fixed Blending ==========
-        # Removed gate network entirely, use fixed 0.5 + 0.5 blending
+        # ========== Zero-init fine MLP last layer ==========
+        # For additive residual: fine branch should start outputting ~0
+        # so that initial output ≈ coarse_output, not coarse + random_noise
+        with torch.no_grad():
+            self.fine_mlp[-1].weight.mul_(0.01)
+            self.fine_mlp[-1].bias.zero_()
+
+        # ========== No Gate: Additive Residual Blending ==========
+        # f_final = f_coarse + f_fine (fine learns residual)
 
         # ========== Residual Refinement (Optional Enhancement) ==========
         # Small MLP to refine the final output
@@ -234,6 +241,10 @@ class MBDCompressor3D(nn.Module):
             nn.ReLU(),
             nn.Linear(mlp_hidden // 2, data_dim)
         )
+        # Zero-init refiner last layer too
+        with torch.no_grad():
+            self.residual_refiner[-1].weight.mul_(0.01)
+            self.residual_refiner[-1].bias.zero_()
 
         # Initialize statistics
         self.M = coeff_res
@@ -251,7 +262,7 @@ class MBDCompressor3D(nn.Module):
         print(f"    - PE frequencies: {pe_num_freqs} -> dim {pe_dim}")
         print(f"    - MLP input: PE({pe_dim}) + GaussianWeights({fine_gaussian_res}) = {fine_input_dim}")
         print(f"    - MLP depth: {fine_mlp_depth} layers, hidden={mlp_hidden}")
-        print(f"  [Blending] Fixed 50-50 (no gate)")
+        print(f"  [Blending] Additive Residual (coarse + fine, no gate)")
         print(f"  [Residual Refiner] Final enhancement")
 
     def gaussian_function_3d(self, p, mu, s, q):
@@ -366,9 +377,9 @@ class MBDCompressor3D(nn.Module):
         # 10. Combine MLP output with Gaussian-interpolated features
         fine_output = fine_mlp_output + 0.3 * fine_gaussian_interp  # [Q, D]
 
-        # ============ Direct Fixed Blending (No Gate) ============
-        # 11. Fixed 50-50 blending between coarse and fine branches
-        blended = 0.5 * coarse_output + 0.5 * fine_output  # [Q, D]
+        # ============ Additive Residual Blending (No Gate) ============
+        # 11. Fine branch learns residual correction on top of coarse
+        blended = coarse_output + fine_output  # [Q, D]
 
         # ============ Residual Refinement ============
         # 13. Small residual correction
@@ -788,8 +799,8 @@ print(f"Original size: {original_size/1024:.1f} KB")
 print("\nStarting Hierarchical Training (Coarse-to-Fine)...")
 losses = solver.train(
     coords, target_data, 
-    epochs_coarse=400,    # Stage 1: Focus on MBD
-    epochs_main=1600,     # Stage 2: Joint training
+    epochs_coarse=500,    # Stage 1: Focus on MBD
+    epochs_main=1500,     # Stage 2: Joint training
     epochs_fine=500,      # Stage 3: Fine-tune details
     batch_size=4096
 )
@@ -1016,7 +1027,7 @@ ax8.grid(False)
 
 # 9. Blending info (Fixed 50-50)
 ax9 = plt.subplot(3, 5, 9)
-ax9.text(0.5, 0.5, 'Fixed Blending\n\n50% Coarse + 50% Fine\n\n(No Gate Network)', 
+ax9.text(0.5, 0.5, 'Additive Residual\n\noutput = coarse + fine\n\nFine learns residual\n(No Gate Network)', 
          ha='center', va='center', fontsize=14, transform=ax9.transAxes)
 ax9.set_title('Blending Strategy')
 ax9.axis('off')
@@ -1194,7 +1205,7 @@ Model Architecture:
   MBD Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]
   Fine (Gaussian): F={model.F} anchors
   Fine (MLP): PE({model.pe_num_freqs}) + {model.mlp_hidden}h
-  Blending: Fixed 50-50 (no gate)
+  Blending: Additive Residual (coarse + fine, no gate)
   Total params: {branch_info['total']}
 
 Compression (float16 quantized):
@@ -1233,7 +1244,7 @@ print(f"    - Fine Gaussian Scale: {fine_s_mean.mean():.4f} (mean)")
 print(f"    - Fine Gaussian Alpha: {fine_alpha.mean():.3f} \u00b1 {fine_alpha.std():.3f}")
 print(f"    - PE frequencies: {model.pe_num_freqs}")
 print(f"    - Hidden size: {model.mlp_hidden}")
-print(f"  [Blending] Fixed 50-50 (no gate)")
+print(f"  [Blending] Additive Residual (coarse + fine, no gate)")
 print(f"\nTraining Strategy (3 Stages):")
 print(f"  Stage 1: {epochs_coarse} epochs - Focus on Coarse (MBD)")
 print(f"  Stage 2: {epochs_main} epochs - Joint training (all branches)")
@@ -1244,7 +1255,7 @@ print(f"  Compression (FP16): {comp_ratio_fp16:.1f}:1 ({comp_size_fp16/1024:.2f}
 print(f"  Final PSNR: {psnr_value:.1f} dB")
 print(f"  Final SSIM: {ssim_value:.4f}")
 print(f"  Coarse-only PSNR: {coarse_psnr:.1f} dB")
-print(f"  Blending: Fixed 50-50 (no gate)")
+print(f"  Blending: Additive Residual (coarse + fine, no gate)")
 print(f"  Coeff Alpha: {coeff_alpha.mean():.3f} \u00b1 {coeff_alpha.std():.3f}")
 print(f"  Basis Alpha: {basis_alpha.mean():.3f} \u00b1 {basis_alpha.std():.3f}")
 print(f"\nKey Innovations:")
@@ -1253,7 +1264,7 @@ print(f"  2. Fine Gaussians: Sparse anchors that learn high-frequency regions")
 print(f"  3. Gaussian-Guided MLP: Spatial awareness for local detail capture")
 print(f"  4. MBD Learnable Scale: Per-basis scale factors")
 print(f"  5. Positional Encoding: Better high-frequency learning")
-print(f"  6. Fixed Blending: Simple 50-50 coarse+fine (no gate overhead)")
+print(f"  6. Additive Residual Blending: coarse + fine (no gate overhead)")
 print(f"  7. Intermediate Supervision: Coarse branch also supervised")
 print(f"  8. Curriculum Learning: λ_coarse decay during training")
 print("="*70)
