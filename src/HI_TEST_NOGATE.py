@@ -70,7 +70,7 @@ def create_test_signal_3d(grid_size=32, num_channels=3):
 
 # Generate 3D test signal
 grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = get_test_signal_by_name("neon", grid_size=32, num_channels=3)
+ground_truth = get_test_signal_by_name("forest_dappled", grid_size=32, num_channels=3)
 D, H, W, C = ground_truth.shape
 print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
 
@@ -375,7 +375,7 @@ class MBDCompressor3D(nn.Module):
         fine_gaussian_interp = torch.matmul(fine_weights, self.fine_features)  # [Q, D]
         
         # 10. Combine MLP output with Gaussian-interpolated features
-        fine_output = fine_mlp_output + 0.3 * fine_gaussian_interp  # [Q, D]
+        fine_output = fine_mlp_output + 0.2 * fine_gaussian_interp  # [Q, D]
 
         # ============ Additive Residual Blending (No Gate) ============
         # 11. Fine branch learns residual correction on top of coarse
@@ -771,10 +771,10 @@ model = MBDCompressor3D(
     coeff_kernel_scale=0.15,  # Initial scale (Coarse - large)
     basis_kernel_scale=0.20,  # Initial scale (Coarse - large)
     mlp_hidden=48,            # MLP hidden size
-    pe_num_freqs=4,           # Positional encoding frequencies
-    fine_mlp_depth=2,         # Fine branch MLP depth
+    pe_num_freqs=6,           # Positional encoding frequencies
+    fine_mlp_depth=1,         # Fine branch MLP depth
     fine_gaussian_res=8,     # Fine Gaussians F (small, sparse anchors)
-    fine_kernel_scale=0.08    # Fine Gaussian scale (small for local detail)
+    fine_kernel_scale=0.05    # Fine Gaussian scale (small for local detail)
 )
 
 # Print detailed architecture info
@@ -1118,7 +1118,7 @@ ax11.semilogy(final_losses, 'g--', linewidth=1.5, alpha=0.7, label='Final Loss')
 ax11.semilogy(coarse_losses, 'r:', linewidth=1.5, alpha=0.7, label='Coarse Loss')
 
 # Mark training stages
-epochs_coarse, epochs_main, epochs_fine = 400, 1600, 500
+epochs_coarse, epochs_main, epochs_fine = 500, 1500, 500
 ax11.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7, label='Stage 1→2')
 ax11.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7, label='Stage 2→3')
 ax11.set_title('Training Loss (3 Stages)')
@@ -1130,7 +1130,7 @@ ax11.grid(True, alpha=0.3)
 # 12. Lambda coarse evolution during training
 ax12 = plt.subplot(3, 5, 12)
 # Reconstruct lambda_coarse values during training
-epochs_coarse_stage, epochs_main_stage, epochs_fine_stage = 400, 1600, 500
+epochs_coarse_stage, epochs_main_stage, epochs_fine_stage = 500, 1500, 500
 lambda_values = []
 initial_lambda = 0.5
 for i in range(len(losses)):
