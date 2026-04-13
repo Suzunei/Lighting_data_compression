@@ -765,15 +765,15 @@ class MBDSolver3D:
 # Create model with hierarchical architecture (NEW: Gaussian-Guided Fine Branch)
 model = MBDCompressor3D(
     num_bases=8,              # Number of bases L
-    coeff_res=32,             # Coefficient 3D Gaussians M (Coarse)
-    basis_res=32,             # Basis 3D Gaussians N (Coarse)
+    coeff_res=8,             # Coefficient 3D Gaussians M (Coarse)
+    basis_res=8,             # Basis 3D Gaussians N (Coarse)
     data_dim=C,               # Data dimension D (RGB)
     coeff_kernel_scale=0.15,  # Initial scale (Coarse - large)
     basis_kernel_scale=0.20,  # Initial scale (Coarse - large)
-    mlp_hidden=48,            # MLP hidden size
+    mlp_hidden=128,            # MLP hidden size
     pe_num_freqs=6,           # Positional encoding frequencies
-    fine_mlp_depth=1,         # Fine branch MLP depth
-    fine_gaussian_res=8,     # Fine Gaussians F (small, sparse anchors)
+    fine_mlp_depth=2,         # Fine branch MLP depth
+    fine_gaussian_res=16,     # Fine Gaussians F (small, sparse anchors)
     fine_kernel_scale=0.05    # Fine Gaussian scale (small for local detail)
 )
 
@@ -1025,12 +1025,19 @@ ax8.set_xlabel('X')
 plt.colorbar(diff_img, ax=ax8, fraction=0.046, pad=0.04)
 ax8.grid(False)
 
-# 9. Blending info (Fixed 50-50)
+# 9. Fine branch output visualization (detailed view)
 ax9 = plt.subplot(3, 5, 9)
-ax9.text(0.5, 0.5, 'Additive Residual\n\noutput = coarse + fine\n\nFine learns residual\n(No Gate Network)', 
-         ha='center', va='center', fontsize=14, transform=ax9.transAxes)
-ax9.set_title('Blending Strategy')
-ax9.axis('off')
+# Normalize fine_slice for better visibility (fine output can be small residuals)
+fine_display = fine_slice - fine_slice.min()
+fine_max = fine_display.max()
+if fine_max > 0:
+    fine_display = fine_display / fine_max
+fine_display = np.clip(fine_display, 0, 1)
+im9 = ax9.imshow(fine_display, vmin=0, vmax=1)
+ax9.set_title(f'Fine Branch (Enhanced)\nRange: [{fine_slice.min():.3f}, {fine_slice.max():.3f}]')
+ax9.set_xlabel('X')
+ax9.grid(False)
+plt.colorbar(im9, ax=ax9, fraction=0.046, pad=0.04)
 
 # 10. 3D Gaussian Transform Visualization (Ellipsoids)
 ax10 = fig.add_subplot(3, 5, 10, projection='3d')
