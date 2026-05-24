@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from test_signal_3d import get_test_signal_by_name, get_all_test_signals
+import os
 
 #运行指令：$env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 #python MBD.py 2>&1
@@ -32,55 +32,70 @@ def quaternion_to_rotation_matrix(q):
     ], dim=-2)
     return R
 
-# ==================== Step 1: Construct 3D test data ====================
-print("Step 1: Generating 3D test data...")
+# ==================== Step 1: Load ILCSampleData probe data ====================
+print("Step 1: Loading ILCSampleData probe data...")
 
-def create_test_signal_3d(grid_size=32, num_channels=3):
+def load_ilc_probe_data(bin_path):
     """
-    创建3D模拟光探针的测试信号。
-    中等频率设计，目标PSNR 45-50dB。
-    返回: 信号 [D, H, W, C]
+    读取ILCSampleData二进制探针数据。
+    
+    每探针32 floats:
+        - Position: 3 floats (x, y, z)
+        - Radius: 1 float
+        - SH coefficients: 27 floats (9 SH bands × 3 RGB channels, RGB交错存储)
+          存储顺序: [SH0_R, SH0_G, SH0_B, SH1_R, SH1_G, SH1_B, ..., SH8_R, SH8_G, SH8_B]
+        - Shadow: 1 float
+    
+    Returns:
+        positions: [N, 3] 归一化到[0,1]的探针位置
+        sh_coeffs: [N, 27] SH系数 (RGB交错)
+        radii: [N] 探针半径
+        shadows: [N] 阴影值
+        pos_min, pos_max: 原始位置范围 (用于反归一化)
     """
-    x = torch.linspace(-1, 1, grid_size)
-    y = torch.linspace(-1, 1, grid_size)
-    z = torch.linspace(-1, 1, grid_size)
-    X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
-    R = torch.sqrt(X**2 + Y**2 + Z**2 + 1e-8)
+    # 读取二进制数据
+    raw_data = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 32)
+    num_probes = raw_data.shape[0]
+    
+    # 解析各字段
+    positions = raw_data[:, 0:3]     # [N, 3] 原始世界坐标
+    radii = raw_data[:, 3]           # [N]
+    sh_coeffs = raw_data[:, 4:31]    # [N, 27] SH系数 (RGB interleaved)
+    shadows = raw_data[:, 31]        # [N]
+    
+    # 归一化位置到 [0, 1] 范围
+    pos_min = positions.min(axis=0)
+    pos_max = positions.max(axis=0)
+    pos_range = pos_max - pos_min
+    pos_range[pos_range < 1e-6] = 1.0  # 防止除零
+    positions_normalized = (positions - pos_min) / pos_range
+    
+    print(f"  Loaded {num_probes} probes from {os.path.basename(bin_path)}")
+    print(f"  Position range: X[{pos_min[0]:.1f}, {pos_max[0]:.1f}], "
+          f"Y[{pos_min[1]:.1f}, {pos_max[1]:.1f}], Z[{pos_min[2]:.1f}, {pos_max[2]:.1f}]")
+    print(f"  Radius range: [{radii.min():.2f}, {radii.max():.2f}]")
+    print(f"  SH range: [{sh_coeffs.min():.6f}, {sh_coeffs.max():.6f}]")
+    print(f"  SH mean: {sh_coeffs.mean():.6f}, std: {sh_coeffs.std():.6f}")
+    print(f"  Shadow range: [{shadows.min():.4f}, {shadows.max():.4f}]")
+    
+    return positions_normalized, sh_coeffs, radii, shadows, pos_min, pos_max
 
-    signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
+# ===== 加载探针数据 =====
+BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ILCSampleData_0.bin')
+positions_np, sh_coeffs_np, radii_np, shadows_np, pos_min, pos_max = load_ilc_probe_data(BIN_PATH)
 
-    # === Red Channel: 环境光 + 软阴影 ===
-    signal[..., 0] = 0.5 + 0.2 * torch.cos(np.pi * R * 0.8)
-    signal[..., 0] += 0.1 * torch.sin(1.5 * np.pi * X) * torch.cos(1.2 * np.pi * Y)
-    signal[..., 0] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * X)
+# 转为PyTorch张量
+coords = torch.from_numpy(positions_np).float()           # [N, 3] 归一化坐标
+target_data = torch.from_numpy(sh_coeffs_np).float()      # [N, 27] SH系数作为压缩目标
 
-    # === Green Channel: 方向性光照 ===
-    signal[..., 1] = 0.5 + 0.18 * X * torch.cos(1.0 * np.pi * Y)
-    signal[..., 1] += 0.08 * torch.sin(1.8 * np.pi * X) * torch.cos(1.5 * np.pi * Z)
+N = coords.shape[0]  # 探针数量
+C = target_data.shape[1]  # 数据维度 = 27 (SH coefficients)
 
-    # === Blue Channel: 天空渐变 ===
-    signal[..., 2] = 0.5 + 0.15 * Z * torch.sin(1.0 * np.pi * (X + Y))
-    signal[..., 2] += 0.06 * torch.sin(2.0 * np.pi * Z) * torch.cos(1.8 * np.pi * Y)
-
-    # 将信号值限制在合理范围
-    for c in range(num_channels):
-        signal[..., c] = torch.clamp(signal[..., c], 0.1, 0.9)
-
-    return signal
-
-# Generate 3D test signal
-grid_size = 32  # 3D网格使用较小的尺寸 (32^3 = 32768个点)
-ground_truth = get_test_signal_by_name("forest_dappled", grid_size=32, num_channels=3)
-D, H, W, C = ground_truth.shape
-print(f"Generated 3D test signal size: {D}x{H}x{W}x{C}")
-
-# Prepare training data: flatten 3D grid
-x_coords = torch.linspace(0, 1, D)
-y_coords = torch.linspace(0, 1, H)
-z_coords = torch.linspace(0, 1, W)
-X_grid, Y_grid, Z_grid = torch.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
-coords = torch.stack([X_grid.flatten(), Y_grid.flatten(), Z_grid.flatten()], dim=-1)  # [N, 3]
-target_data = ground_truth.view(-1, C)  # [N, C]
+print(f"\n  Training data prepared:")
+print(f"    Num probes (N): {N}")
+print(f"    SH channels (C): {C} (9 SH bands × 3 RGB, interleaved)")
+print(f"    Coords shape: {coords.shape}")
+print(f"    Target shape: {target_data.shape}")
 
 # ==================== Step 2: Implement MBD model and solver ====================
 print("\nStep 2: Building MBD model and solver...")
@@ -513,11 +528,25 @@ class MBDSolver3D:
         Stage 2 (Fine Focus): Gradually shift focus to fine branch (Gaussian + MLP)
         Stage 3 (Joint Refinement): Fine-tune all branches together
     """
-    def __init__(self, model, lambda_reg=0.01, lambda_coarse=0.5):
+    def __init__(self, model, lambda_reg=0.01, lambda_coarse=0.5, target_data=None):
         self.model = model
         self.lambda_reg = lambda_reg
         self.lambda_coarse = lambda_coarse  # Weight for coarse supervision
         self.initial_lambda_coarse = lambda_coarse
+
+        # ===== Per-channel loss weighting (variance-inverse) =====
+        # Balances gradient across SH orders so weak channels (L1/L2) get fair training
+        if target_data is not None and model.data_dim > 3:
+            with torch.no_grad():
+                ch_var = target_data.var(dim=0)  # [C] per-channel variance
+                ch_weights = 1.0 / (ch_var + 1e-6)
+                ch_weights = ch_weights / ch_weights.mean()  # normalize to mean=1
+                self.channel_weights = ch_weights  # [C]
+                print(f"  [Channel Weighting] Enabled for {model.data_dim}D data")
+                print(f"    Variance range: [{ch_var.min():.6f}, {ch_var.max():.6f}]")
+                print(f"    Weight range:   [{ch_weights.min():.2f}, {ch_weights.max():.2f}]")
+        else:
+            self.channel_weights = None
 
         # Separate parameter groups for different learning dynamics
         # Coarse Gaussian params (for MBD)
@@ -560,19 +589,24 @@ class MBDSolver3D:
     def compute_loss(self, pred, target, coarse_output=None):
         """
         Compute hierarchical loss with intermediate supervision.
-        
-        Loss = λ_final * L_final + λ_coarse * L_coarse + λ_reg * L_reg
-        
-        Intermediate supervision on coarse branch encourages MBD to learn
-        meaningful low-frequency representation independently.
+        Per-channel weighting ensures balanced gradients across SH orders.
         """
-        # 1. Final reconstruction loss (MSE)
-        final_loss = torch.mean((pred - target) ** 2)
+        # 1. Final reconstruction loss (weighted MSE)
+        sq_err = (pred - target) ** 2  # [B, C]
+        if self.channel_weights is not None:
+            w = self.channel_weights.to(pred.device)  # [C]
+            final_loss = torch.mean(sq_err * w.unsqueeze(0))
+        else:
+            final_loss = torch.mean(sq_err)
         
-        # 2. Coarse branch intermediate supervision (if provided)
+        # 2. Coarse branch intermediate supervision (same weighting)
         coarse_loss = torch.tensor(0.0, device=pred.device)
         if coarse_output is not None:
-            coarse_loss = torch.mean((coarse_output - target) ** 2)
+            coarse_sq_err = (coarse_output - target) ** 2
+            if self.channel_weights is not None:
+                coarse_loss = torch.mean(coarse_sq_err * w.unsqueeze(0))
+            else:
+                coarse_loss = torch.mean(coarse_sq_err)
         
         # 3. Regularization: prevent scale explosion
         coeff_s = torch.exp(self.model.coeff_log_s)
@@ -762,18 +796,19 @@ class MBDSolver3D:
         return losses
 
 # ==================== Hierarchical MBD + Gaussian + MLP with Coarse-to-Fine Decoding ====================
-# Create model with hierarchical architecture (NEW: Gaussian-Guided Fine Branch)
+# Create model with hierarchical architecture for SH compression
+# 27D SH data requires more capacity than 3D RGB
 model = MBDCompressor3D(
-    num_bases=8,              # Number of bases L
-    coeff_res=8,             # Coefficient 3D Gaussians M (Coarse)
-    basis_res=8,             # Basis 3D Gaussians N (Coarse)
-    data_dim=C,               # Data dimension D (RGB)
-    coeff_kernel_scale=0.15,  # Initial scale (Coarse - large)
-    basis_kernel_scale=0.20,  # Initial scale (Coarse - large)
-    mlp_hidden=128,            # MLP hidden size
+    num_bases=16,              # Number of bases L (more for 27D)
+    coeff_res=64,             # Coefficient 3D Gaussians M (Coarse)
+    basis_res=64,             # Basis 3D Gaussians N (Coarse)
+    data_dim=C,               # Data dimension D = 27 (SH coefficients)
+    coeff_kernel_scale=0.12,  # Initial scale (Coarse - large, scattered probes)
+    basis_kernel_scale=0.18,  # Initial scale (Coarse - large)
+    mlp_hidden=512,            # MLP hidden size (larger for 27D output)
     pe_num_freqs=6,           # Positional encoding frequencies
-    fine_mlp_depth=1,         # Fine branch MLP depth
-    fine_gaussian_res=16,     # Fine Gaussians F (small, sparse anchors)
+    fine_mlp_depth=3,         # Fine branch MLP depth (deeper for SH detail)
+    fine_gaussian_res=32,     # Fine Gaussians F (more anchors for scattered data)
     fine_kernel_scale=0.05    # Fine Gaussian scale (small for local detail)
 )
 
@@ -789,18 +824,18 @@ print(f"  Residual Refiner:   {branch_info['residual_refiner']:6d} params")
 print(f"  Total:              {branch_info['total']:6d} params")
 
 # Create solver with hierarchical training strategy
-solver = MBDSolver3D(model, lambda_reg=1e-5, lambda_coarse=0.5)
+solver = MBDSolver3D(model, lambda_reg=1e-5, lambda_coarse=0.5, target_data=target_data)
 
-# 计算原始数据大小
-original_size = D * H * W * C * 4  # float32
-print(f"Original size: {original_size/1024:.1f} KB")
+# 计算原始数据大小 (N个探针 × 27 SH系数 × 4 bytes)
+original_size = N * C * 4  # float32
+print(f"Original size: {original_size/1024:.1f} KB ({N} probes × {C} channels × 4B)")
 
 # Train model with hierarchical strategy (Coarse -> Joint -> Fine)
 print("\nStarting Hierarchical Training (Coarse-to-Fine)...")
 losses = solver.train(
     coords, target_data, 
     epochs_coarse=500,    # Stage 1: Focus on MBD
-    epochs_main=1500,     # Stage 2: Joint training
+    epochs_main=2500,     # Stage 2: Joint training
     epochs_fine=500,      # Stage 3: Fine-tune details
     batch_size=4096
 )
@@ -837,307 +872,299 @@ comp_ratio = comp_ratio_fp16
 comp_size = comp_size_fp16
 
 # ==================== Step 3: Evaluation and visualization ====================
-print("\nStep 3: Evaluating compression and reconstruction quality...")
+print("\nStep 3: Evaluating SH compression quality...")
 
-# Reconstruct entire 3D volume using trained model
+# Reconstruct all probes using trained model
 model.eval()
 with torch.no_grad():
-    # Get all components for analysis
-    results = model(coords, return_components=True)
-    reconstructed = results['reconstruction']
-    coarse_recon = results['coarse_output']
-    fine_recon = results['fine_output']
+    # Process in batches to avoid OOM for large probe sets
+    batch_size_eval = 8192
+    reconstructed_list = []
+    coarse_list = []
+    fine_list = []
     
-    reconstructed_vol = reconstructed.view(D, H, W, C).cpu().numpy()
-    coarse_vol = coarse_recon.view(D, H, W, C).cpu().numpy()
-    fine_vol = fine_recon.view(D, H, W, C).cpu().numpy()
+    for i in range(0, N, batch_size_eval):
+        batch_coords = coords[i:i+batch_size_eval]
+        results = model(batch_coords, return_components=True)
+        reconstructed_list.append(results['reconstruction'].cpu())
+        coarse_list.append(results['coarse_output'].cpu())
+        fine_list.append(results['fine_output'].cpu())
     
-    # Clip to valid range [0, 1]
-    reconstructed_vol = np.clip(reconstructed_vol, 0, 1)
-    coarse_vol = np.clip(coarse_vol, 0, 1)
-    fine_vol = np.clip(fine_vol, 0, 1)
+    reconstructed = torch.cat(reconstructed_list, dim=0).numpy()  # [N, 27]
+    coarse_recon = torch.cat(coarse_list, dim=0).numpy()          # [N, 27]
+    fine_recon = torch.cat(fine_list, dim=0).numpy()              # [N, 27]
 
-# Compute PSNR and SSIM used for evaluation the reconstruction quality
-def compute_psnr(img1, img2):
-    mse = np.mean((img1 - img2) ** 2)
+ground_truth_np = target_data.numpy()  # [N, 27]
+
+# Compute per-channel PSNR
+def compute_psnr_channel(gt, pred):
+    """Compute PSNR for a single channel (1D arrays)"""
+    mse = np.mean((gt - pred) ** 2)
     if mse == 0:
         return float('inf')
-    max_pixel = 1.0
-    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
+    # Use data range for PSNR calculation
+    data_range = gt.max() - gt.min()
+    if data_range < 1e-8:
+        data_range = 1.0
+    psnr = 20 * np.log10(data_range / np.sqrt(mse))
     return psnr
 
-def compute_ssim(img1, img2, window_size=11):
-    """Compute SSIM for multi-channel images"""
-    from scipy.signal import fftconvolve
-    from numpy import asarray, prod
-
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-
-    # Process multi-channel images: compute SSIM for each channel separately, then average
-    if img1.ndim == 3:
-        ssim_channels = []
-        for c in range(img1.shape[2]):
-            ssim_c = compute_ssim(img1[:, :, c], img2[:, :, c], window_size)
-            ssim_channels.append(ssim_c)
-        return np.mean(ssim_channels)
-
-    # Generate Gaussian window
-    gaussian = np.outer(
-        np.exp(-(np.arange(window_size) - window_size//2)**2 / 1.5),
-        np.exp(-(np.arange(window_size) - window_size//2)**2 / 1.5)
-    )
-    gaussian /= gaussian.sum()
-
-    # Compute local statistics
-    def filter_window(x):
-        return fftconvolve(x, gaussian, mode='valid')
-
-    mu1 = filter_window(img1)
-    mu2 = filter_window(img2)
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = filter_window(img1*img1) - mu1_sq
-    sigma2_sq = filter_window(img2*img2) - mu2_sq
-    sigma12 = filter_window(img1*img2) - mu1_mu2
-
-    # SSIM formula
-    C1 = (0.01 * 1.0) ** 2
-    C2 = (0.03 * 1.0) ** 2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
+def compute_ssim_channel(gt, pred, window_size=101):
+    """
+    Compute SSIM for scattered probe data (1D signal per channel).
+    Uses sliding window statistics along spatially-sorted probes.
+    
+    For scattered data, we sort probes by their spatial index (Morton/Z-order)
+    and compute local SSIM statistics using a sliding window.
+    
+    gt, pred: [N] arrays - ground truth and prediction for one channel
+    window_size: local window for statistics computation
+    Returns: scalar SSIM value
+    """
+    gt = gt.astype(np.float64)
+    pred = pred.astype(np.float64)
+    
+    n = len(gt)
+    if n < window_size:
+        # Fallback: compute global SSIM
+        mu_x = np.mean(gt)
+        mu_y = np.mean(pred)
+        sigma_x_sq = np.var(gt)
+        sigma_y_sq = np.var(pred)
+        sigma_xy = np.mean((gt - mu_x) * (pred - mu_y))
+        
+        data_range = max(gt.max() - gt.min(), pred.max() - pred.min(), 1e-8)
+        C1 = (0.01 * data_range) ** 2
+        C2 = (0.03 * data_range) ** 2
+        
+        ssim = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / \
+               ((mu_x**2 + mu_y**2 + C1) * (sigma_x_sq + sigma_y_sq + C2))
+        return ssim
+    
+    # Use cumulative sums for efficient sliding window
+    # Pad for 'valid' convolution equivalent
+    half_w = window_size // 2
+    
+    # Compute local means using uniform filter (sliding average)
+    from scipy.ndimage import uniform_filter1d
+    mu_x = uniform_filter1d(gt, size=window_size, mode='reflect')
+    mu_y = uniform_filter1d(pred, size=window_size, mode='reflect')
+    
+    mu_x_sq = mu_x ** 2
+    mu_y_sq = mu_y ** 2
+    mu_xy = mu_x * mu_y
+    
+    sigma_x_sq = uniform_filter1d(gt ** 2, size=window_size, mode='reflect') - mu_x_sq
+    sigma_y_sq = uniform_filter1d(pred ** 2, size=window_size, mode='reflect') - mu_y_sq
+    sigma_xy = uniform_filter1d(gt * pred, size=window_size, mode='reflect') - mu_xy
+    
+    # Clamp negative variances (numerical)
+    sigma_x_sq = np.maximum(sigma_x_sq, 0)
+    sigma_y_sq = np.maximum(sigma_y_sq, 0)
+    
+    # Dynamic data range
+    data_range = max(gt.max() - gt.min(), pred.max() - pred.min(), 1e-8)
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / \
+               ((mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2))
+    
     return np.mean(ssim_map)
 
-# 计算指标（对每个通道计算平均PSNR）
+# Spatial sorting for SSIM: sort probes by Morton code (Z-order curve)
+# This ensures spatially nearby probes are adjacent for local SSIM computation
+def morton_code_3d(coords_np, bits=10):
+    """Compute Morton (Z-order) code for 3D coordinates in [0,1]"""
+    # Quantize to integer grid
+    max_val = (1 << bits) - 1
+    ix = np.clip((coords_np[:, 0] * max_val).astype(np.int64), 0, max_val)
+    iy = np.clip((coords_np[:, 1] * max_val).astype(np.int64), 0, max_val)
+    iz = np.clip((coords_np[:, 2] * max_val).astype(np.int64), 0, max_val)
+    
+    # Interleave bits (simplified for reasonable precision)
+    code = np.zeros(len(ix), dtype=np.int64)
+    for b in range(bits):
+        code |= ((ix >> b) & 1).astype(np.int64) << (3 * b)
+        code |= ((iy >> b) & 1).astype(np.int64) << (3 * b + 1)
+        code |= ((iz >> b) & 1).astype(np.int64) << (3 * b + 2)
+    return code
+
+# Sort probes spatially for meaningful SSIM
+morton_codes = morton_code_3d(coords.numpy())
+spatial_sort_idx = np.argsort(morton_codes)
+gt_sorted = ground_truth_np[spatial_sort_idx]      # [N, 27] spatially sorted
+rec_sorted = reconstructed[spatial_sort_idx]        # [N, 27] spatially sorted
+coarse_sorted = coarse_recon[spatial_sort_idx]      # [N, 27] spatially sorted
+
+# Per-channel metrics (PSNR + SSIM)
 psnr_values = []
 ssim_values = []
-z_slice = D // 2  # 取Z中间切片进行评估
 for c in range(C):
-    gt_slice = ground_truth[z_slice, :, :, c].numpy()
-    rec_slice = reconstructed_vol[z_slice, :, :, c]
-    psnr_c = compute_psnr(gt_slice, rec_slice)
-    ssim_c = compute_ssim(gt_slice, rec_slice)
+    psnr_c = compute_psnr_channel(ground_truth_np[:, c], reconstructed[:, c])
+    ssim_c = compute_ssim_channel(gt_sorted[:, c], rec_sorted[:, c])
     psnr_values.append(psnr_c)
     ssim_values.append(ssim_c)
 
 psnr_value = np.mean(psnr_values)
 ssim_value = np.mean(ssim_values)
 
-print(f"Reconstruction quality metrics (Z={z_slice} slice):")
+# Coarse-only PSNR + SSIM
+coarse_psnr_values = []
+coarse_ssim_values = []
+for c in range(C):
+    psnr_c = compute_psnr_channel(ground_truth_np[:, c], coarse_recon[:, c])
+    ssim_c = compute_ssim_channel(gt_sorted[:, c], coarse_sorted[:, c])
+    coarse_psnr_values.append(psnr_c)
+    coarse_ssim_values.append(ssim_c)
+coarse_psnr = np.mean(coarse_psnr_values)
+coarse_ssim = np.mean(coarse_ssim_values)
+
+# Overall MSE and relative error
+overall_mse = np.mean((ground_truth_np - reconstructed) ** 2)
+relative_error = np.sqrt(overall_mse) / (np.std(ground_truth_np) + 1e-8)
+
+print(f"\nReconstruction quality metrics ({N} probes, {C} channels):")
 print(f"  Avg PSNR: {psnr_value:.2f} dB")
 print(f"  Avg SSIM: {ssim_value:.4f}")
+print(f"  Coarse PSNR: {coarse_psnr:.2f} dB")
+print(f"  Coarse SSIM: {coarse_ssim:.4f}")
+print(f"  Overall MSE: {overall_mse:.8f}")
+print(f"  Relative Error: {relative_error:.6f}")
 print(f"  Final loss: {losses[-1]['total_loss']:.6f}")
 
-# ==================== Visualization results (Hierarchical Decoding with Gaussian-Guided Fine) ====================
-print("\nGenerating Hierarchical Visualization results...")
+# ===== Per-SH-order PSNR/SSIM breakdown =====
+# SH layout: RGB interleaved, 9 bands per color
+# Channel order: [SH0_R, SH0_G, SH0_B, SH1_R, SH1_G, SH1_B, ..., SH8_R, SH8_G, SH8_B]
+# SH order-0: 1 band (index 0), order-1: 3 bands (1-3), order-2: 5 bands (4-8)
+sh_order_ranges = [
+    (0, [0]),       # L0: 1 band
+    (1, [1, 2, 3]), # L1: 3 bands
+    (2, [4, 5, 6, 7, 8])  # L2: 5 bands
+]
 
-# Get middle slice for visualization
-gt_slice = ground_truth[z_slice, :, :, :].numpy()  # [H, W, C]
-rec_slice = reconstructed_vol[z_slice, :, :, :]    # [H, W, C]
-coarse_slice = coarse_vol[z_slice, :, :, :]        # [H, W, C]
-fine_slice = fine_vol[z_slice, :, :, :]            # [H, W, C]
+print(f"\n  Per-SH-Order Breakdown (RGB interleaved, 9 bands × 3 colors):")
+print(f"  {'Order':<8} {'Bands':<12} {'Channels':<10} {'Avg PSNR':>10} {'Avg SSIM':>10}")
+print(f"  {'-'*54}")
+for sh_order, band_indices in sh_order_ranges:
+    # RGB interleaved: channel index = band_idx * 3 + color_idx
+    order_channels = []
+    for band_idx in band_indices:
+        for color_idx in range(3):  # R, G, B
+            order_channels.append(band_idx * 3 + color_idx)
+    order_psnr = np.mean([psnr_values[c] for c in order_channels])
+    order_ssim = np.mean([ssim_values[c] for c in order_channels])
+    print(f"  L{sh_order:<7} {len(band_indices)} bands     {len(order_channels):>2}ch       {order_psnr:>8.2f} dB  {order_ssim:>8.4f}")
 
-fig = plt.figure(figsize=(28, 16))
+# ==================== Visualization results (SH Compression for ILC Probes) ====================
+print("\nGenerating SH Compression Visualization results...")
 
-# Row 1: Original, Final, Coarse, Fine, Fine Gaussian Positions
-# 1. Original signal
-ax1 = plt.subplot(3, 5, 1)
-im1 = ax1.imshow(gt_slice, vmin=0, vmax=1)
-ax1.set_title(f'Ground Truth (Z={z_slice})\n{D}x{H}x{W}x{C}')
-ax1.set_xlabel('X')
-ax1.set_ylabel('Y')
-ax1.grid(False)
-
-# 2. Final reconstruction (Coarse + Fine blended)
-ax2 = plt.subplot(3, 5, 2)
-im2 = ax2.imshow(rec_slice, vmin=0, vmax=1)
-ax2.set_title(f'Final Output (Blended)\nPSNR: {psnr_value:.1f}dB, Ratio: {comp_ratio:.1f}:1')
-ax2.set_xlabel('X')
-ax2.grid(False)
-
-# 3. Coarse branch output (MBD only)
-coarse_psnr = compute_psnr(gt_slice.mean(axis=-1), coarse_slice.mean(axis=-1))
-ax3 = plt.subplot(3, 5, 3)
-im3 = ax3.imshow(coarse_slice, vmin=0, vmax=1)
-ax3.set_title(f'Coarse Branch (MBD)\nPSNR: {coarse_psnr:.1f}dB')
-ax3.set_xlabel('X')
-ax3.grid(False)
-
-# 4. Fine branch output (Gaussian + MLP)
-fine_psnr = compute_psnr(gt_slice.mean(axis=-1), fine_slice.mean(axis=-1))
-ax4 = plt.subplot(3, 5, 4)
-im4 = ax4.imshow(fine_slice, vmin=0, vmax=1)
-ax4.set_title(f'Fine Branch (Gauss+MLP)\nPSNR: {fine_psnr:.1f}dB')
-ax4.set_xlabel('X')
-ax4.grid(False)
-
-# 5. Fine Gaussian positions overlay on error map
-ax5 = plt.subplot(3, 5, 5)
-error_for_overlay = np.abs(gt_slice - coarse_slice).mean(axis=-1)
-ax5.imshow(error_for_overlay, cmap='hot', vmin=0, vmax=0.15)
-# Overlay Fine Gaussian positions (projected to Z slice)
+# Get Gaussian params for visualization
 gaussian_params = model.get_gaussian_params()
 fine_mu = gaussian_params['fine_mu']
 fine_s = gaussian_params['fine_s']
 fine_alpha = gaussian_params['fine_alpha']
-# Filter gaussians near this Z slice
-z_tolerance = 0.15
-near_slice_mask = np.abs(fine_mu[:, 2] - z_slice / D) < z_tolerance
-for i in range(len(fine_mu)):
-    if near_slice_mask[i]:
-        x_pos = fine_mu[i, 0] * W
-        y_pos = fine_mu[i, 1] * H
-        size = np.mean(fine_s[i]) * 500 * fine_alpha[i]
-        ax5.scatter(x_pos, y_pos, s=size, c='cyan', alpha=0.7, edgecolors='white', linewidths=1)
-ax5.set_title(f'Fine Gaussians on Coarse Error\n{near_slice_mask.sum()}/{len(fine_mu)} near Z={z_slice}')
-ax5.set_xlabel('X')
-ax5.grid(False)
 
-# Row 2: Error maps and Gate visualization
-# 6. Final error map
-ax6 = plt.subplot(3, 5, 6)
-error = np.abs(gt_slice - rec_slice)
-error_img = ax6.imshow(error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
-ax6.set_title(f'Final Error\nSSIM: {ssim_value:.4f}')
-ax6.set_xlabel('X')
-plt.colorbar(error_img, ax=ax6, fraction=0.046, pad=0.04)
-ax6.grid(False)
+fig = plt.figure(figsize=(24, 16))
 
-# 7. Coarse error map
-ax7 = plt.subplot(3, 5, 7)
-coarse_error = np.abs(gt_slice - coarse_slice)
-coarse_error_img = ax7.imshow(coarse_error.mean(axis=-1), cmap='hot', vmin=0, vmax=0.15)
-ax7.set_title('Coarse Branch Error')
-ax7.set_xlabel('X')
-plt.colorbar(coarse_error_img, ax=ax7, fraction=0.046, pad=0.04)
-ax7.grid(False)
+# ===== Row 1: 3D Probe Distribution & Error Visualization =====
 
-# 8. Coarse vs Fine comparison
-ax8 = plt.subplot(3, 5, 8)
-diff_coarse_fine = np.abs(coarse_slice - fine_slice).mean(axis=-1)
-diff_img = ax8.imshow(diff_coarse_fine, cmap='viridis', vmin=0, vmax=0.3)
-ax8.set_title('|Coarse - Fine| Difference')
-ax8.set_xlabel('X')
-plt.colorbar(diff_img, ax=ax8, fraction=0.046, pad=0.04)
-ax8.grid(False)
+# 1. 3D Probe positions colored by reconstruction error
+ax1 = fig.add_subplot(3, 4, 1, projection='3d')
+per_probe_error = np.mean((ground_truth_np - reconstructed) ** 2, axis=1)  # [N]
+# Subsample for visualization (too many points)
+vis_indices = np.random.choice(N, min(5000, N), replace=False)
+sc1 = ax1.scatter(coords[vis_indices, 0].numpy(), 
+                  coords[vis_indices, 1].numpy(),
+                  coords[vis_indices, 2].numpy(),
+                  c=per_probe_error[vis_indices], cmap='hot', s=1, alpha=0.5)
+ax1.set_title(f'Probe Error Distribution\n{N} probes (showing {len(vis_indices)})')
+ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+plt.colorbar(sc1, ax=ax1, fraction=0.02, pad=0.1)
 
-# 9. Fine branch output visualization (detailed view)
-ax9 = plt.subplot(3, 5, 9)
-# Normalize fine_slice for better visibility (fine output can be small residuals)
-fine_display = fine_slice - fine_slice.min()
-fine_max = fine_display.max()
-if fine_max > 0:
-    fine_display = fine_display / fine_max
-fine_display = np.clip(fine_display, 0, 1)
-im9 = ax9.imshow(fine_display, vmin=0, vmax=1)
-ax9.set_title(f'Fine Branch (Enhanced)\nRange: [{fine_slice.min():.3f}, {fine_slice.max():.3f}]')
-ax9.set_xlabel('X')
-ax9.grid(False)
-plt.colorbar(im9, ax=ax9, fraction=0.046, pad=0.04)
-
-# 10. 3D Gaussian Transform Visualization (Ellipsoids)
-ax10 = fig.add_subplot(3, 5, 10, projection='3d')
-
-# Retrieve all gaussian params (coeff, basis, fine)
-coeff_q_viz = gaussian_params['coeff_q']
-basis_mu_viz = gaussian_params['basis_mu'] if 'basis_mu' not in dir() else gaussian_params['basis_mu']
-basis_s_viz = gaussian_params['basis_s'] if 'basis_s' not in dir() else gaussian_params['basis_s']
-basis_q_viz = gaussian_params['basis_q'] if 'basis_q' not in dir() else gaussian_params['basis_q']
-fine_q_viz = gaussian_params['fine_q']
-
-def draw_ellipsoid(ax, center, scale, quaternion, n_points=12, alpha=0.1, color='blue'):
-    """Draw ellipsoid in 3D to represent Gaussian covariance shape"""
-    u = np.linspace(0, 2 * np.pi, n_points)
-    v = np.linspace(0, np.pi, n_points // 2)
-    x = np.outer(np.cos(u), np.sin(v))
-    y = np.outer(np.sin(u), np.sin(v))
-    z = np.outer(np.ones(np.size(u)), np.cos(v))
-    # Apply scale
-    x = x * scale[0]
-    y = y * scale[1]
-    z = z * scale[2]
-    # Quaternion to rotation matrix
-    q_norm = quaternion / (np.linalg.norm(quaternion) + 1e-8)
-    w_q, x_q, y_q, z_q = q_norm
-    R = np.array([
-        [1 - 2*y_q*y_q - 2*z_q*z_q, 2*x_q*y_q - 2*w_q*z_q, 2*x_q*z_q + 2*w_q*y_q],
-        [2*x_q*y_q + 2*w_q*z_q, 1 - 2*x_q*x_q - 2*z_q*z_q, 2*y_q*z_q - 2*w_q*x_q],
-        [2*x_q*z_q - 2*w_q*y_q, 2*y_q*z_q + 2*w_q*x_q, 1 - 2*x_q*x_q - 2*y_q*y_q]
-    ])
-    points = np.array([x.flatten(), y.flatten(), z.flatten()])
-    rotated_points = R @ points
-    x_rot = rotated_points[0, :].reshape(x.shape) + center[0]
-    y_rot = rotated_points[1, :].reshape(y.shape) + center[1]
-    z_rot = rotated_points[2, :].reshape(z.shape) + center[2]
-    ax.plot_surface(x_rot, y_rot, z_rot, alpha=alpha, color=color, linewidth=0)
-
-# Draw gaussian center points
+# 2. 3D Gaussian Ellipsoids (all types)
+ax2 = fig.add_subplot(3, 4, 2, projection='3d')
 coeff_mu_viz = gaussian_params['coeff_mu']
 coeff_s_viz = gaussian_params['coeff_s']
 basis_mu_viz = gaussian_params['basis_mu']
 basis_s_viz = gaussian_params['basis_s']
 
-ax10.scatter(coeff_mu_viz[:, 0], coeff_mu_viz[:, 1], coeff_mu_viz[:, 2],
-            c='red', s=20, alpha=0.7, label=f'Coeff (M={model.M})')
-ax10.scatter(basis_mu_viz[:, 0], basis_mu_viz[:, 1], basis_mu_viz[:, 2],
-            c='blue', s=25, marker='s', alpha=0.7, label=f'Basis (N={model.N})')
-ax10.scatter(fine_mu[:, 0], fine_mu[:, 1], fine_mu[:, 2],
-            c='cyan', s=15, marker='^', alpha=0.7, label=f'Fine (F={model.F})')
+ax2.scatter(coeff_mu_viz[:, 0], coeff_mu_viz[:, 1], coeff_mu_viz[:, 2],
+            c='red', s=40, alpha=0.8, label=f'Coeff (M={model.M})')
+ax2.scatter(basis_mu_viz[:, 0], basis_mu_viz[:, 1], basis_mu_viz[:, 2],
+            c='blue', s=50, marker='s', alpha=0.8, label=f'Basis (N={model.N})')
+ax2.scatter(fine_mu[:, 0], fine_mu[:, 1], fine_mu[:, 2],
+            c='cyan', s=25, marker='^', alpha=0.8, label=f'Fine (F={model.F})')
+ax2.set_xlim(0, 1); ax2.set_ylim(0, 1); ax2.set_zlim(0, 1)
+ax2.set_title(f'3D Gaussian Anchors\nM={model.M}, N={model.N}, F={model.F}')
+ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+ax2.legend(fontsize='x-small', loc='upper left')
 
-# Draw ellipsoids for coeff gaussians
-num_show = min(32, model.M)
-indices_coeff = np.linspace(0, model.M - 1, num_show, dtype=int)
-for idx in indices_coeff:
-    draw_ellipsoid(ax10, coeff_mu_viz[idx], coeff_s_viz[idx], coeff_q_viz[idx], color='red', alpha=0.06)
+# 3. Per-channel PSNR bar chart
+ax3 = plt.subplot(3, 4, 3)
+# Group by SH order and show as grouped bars
+colors_order = ['#2ecc71', '#3498db', '#e74c3c']
+bar_data = []
+bar_labels = []
+bar_colors = []
+for sh_order, band_indices in sh_order_ranges:
+    for band_idx in band_indices:
+        for color_idx, color_name in enumerate(['R', 'G', 'B']):
+            ch_idx = band_idx * 3 + color_idx
+            bar_data.append(psnr_values[ch_idx])
+            bar_labels.append(f'SH{band_idx}_{color_name}')
+            bar_colors.append(colors_order[sh_order])
 
-# Draw ellipsoids for basis gaussians
-num_show_b = min(32, model.N)
-indices_basis = np.linspace(0, model.N - 1, num_show_b, dtype=int)
-for idx in indices_basis:
-    draw_ellipsoid(ax10, basis_mu_viz[idx], basis_s_viz[idx], basis_q_viz[idx], color='blue', alpha=0.06)
+x_pos = np.arange(len(bar_data))
+ax3.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, width=0.8)
+ax3.axhline(y=psnr_value, color='black', linestyle='--', alpha=0.5, label=f'Avg: {psnr_value:.1f}dB')
+ax3.set_title(f'Per-Channel PSNR\nAvg: {psnr_value:.1f}dB')
+ax3.set_xlabel('Channel')
+ax3.set_ylabel('PSNR (dB)')
+ax3.set_xticks(x_pos[::3])
+ax3.set_xticklabels([f'SH{i}' for i in range(9)], fontsize=7)
+ax3.legend(fontsize='small')
+ax3.grid(True, alpha=0.3, axis='y')
 
-# Draw ellipsoids for fine gaussians
-for idx in range(model.F):
-    draw_ellipsoid(ax10, fine_mu[idx], fine_s[idx], fine_q_viz[idx], color='cyan', alpha=0.10)
+# 4. SH coefficient distribution (GT vs Reconstructed)
+ax4 = plt.subplot(3, 4, 4)
+# Show DC (L0) channel distribution
+for color_idx, (color, name) in enumerate(zip(['red', 'green', 'blue'], ['R', 'G', 'B'])):
+    ch_idx = color_idx  # SH0_R=0, SH0_G=1, SH0_B=2
+    ax4.hist(ground_truth_np[:, ch_idx], bins=50, alpha=0.3, color=color, 
+             label=f'GT L0_{name}', density=True)
+    ax4.hist(reconstructed[:, ch_idx], bins=50, alpha=0.3, color=color,
+             linestyle='--', density=True, histtype='step', linewidth=2)
+ax4.set_title('SH L0 (DC) Distribution\nSolid=GT, Line=Pred')
+ax4.set_xlabel('SH Coefficient Value')
+ax4.set_ylabel('Density')
+ax4.legend(fontsize='x-small')
+ax4.grid(True, alpha=0.3)
 
-ax10.set_xlim(0, 1)
-ax10.set_ylim(0, 1)
-ax10.set_zlim(0, 1)
-ax10.set_title(f'3D Gaussian Ellipsoids\nM={model.M}, N={model.N}, F={model.F}')
-ax10.set_xlabel('X')
-ax10.set_ylabel('Y')
-ax10.set_zlabel('Z')
-ax10.legend(fontsize='xx-small', loc='upper left')
+# ===== Row 2: Training curves and error analysis =====
 
-# Row 3: Training curves and statistics
-# 11. Training loss curves
-ax11 = plt.subplot(3, 5, 11)
+# 5. Training loss curves
+ax5 = plt.subplot(3, 4, 5)
 total_losses = [l['total_loss'] for l in losses]
 final_losses = [l['final_loss'] for l in losses]
 coarse_losses = [l['coarse_loss'] for l in losses]
 
-ax11.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
-ax11.semilogy(final_losses, 'g--', linewidth=1.5, alpha=0.7, label='Final Loss')
-ax11.semilogy(coarse_losses, 'r:', linewidth=1.5, alpha=0.7, label='Coarse Loss')
+ax5.semilogy(total_losses, 'b-', linewidth=2, label='Total Loss')
+ax5.semilogy(final_losses, 'g--', linewidth=1.5, alpha=0.7, label='Final Loss')
+ax5.semilogy(coarse_losses, 'r:', linewidth=1.5, alpha=0.7, label='Coarse Loss')
 
 # Mark training stages
-epochs_coarse, epochs_main, epochs_fine = 500, 1500, 500
-ax11.axvline(x=epochs_coarse, color='orange', linestyle=':', alpha=0.7, label='Stage 1→2')
-ax11.axvline(x=epochs_coarse + epochs_main, color='purple', linestyle=':', alpha=0.7, label='Stage 2→3')
-ax11.set_title('Training Loss (3 Stages)')
-ax11.set_xlabel('Iterations')
-ax11.set_ylabel('Loss Value')
-ax11.legend(fontsize='x-small', loc='upper right')
-ax11.grid(True, alpha=0.3)
+epochs_coarse_stage, epochs_main_stage, epochs_fine_stage = 500, 2500, 500
+ax5.axvline(x=epochs_coarse_stage, color='orange', linestyle=':', alpha=0.7, label='Stage 1\u21922')
+ax5.axvline(x=epochs_coarse_stage + epochs_main_stage, color='purple', linestyle=':', alpha=0.7, label='Stage 2\u21923')
+ax5.set_title('Training Loss (3 Stages)')
+ax5.set_xlabel('Iterations')
+ax5.set_ylabel('Loss Value')
+ax5.legend(fontsize='x-small', loc='upper right')
+ax5.grid(True, alpha=0.3)
 
-# 12. Lambda coarse evolution during training
-ax12 = plt.subplot(3, 5, 12)
-# Reconstruct lambda_coarse values during training
-epochs_coarse_stage, epochs_main_stage, epochs_fine_stage = 500, 1500, 500
+# 6. Lambda coarse evolution
+ax6 = plt.subplot(3, 4, 6)
 lambda_values = []
 initial_lambda = 0.5
 for i in range(len(losses)):
@@ -1148,130 +1175,182 @@ for i in range(len(losses)):
         lambda_values.append(initial_lambda * (1 - 0.8 * progress))
     else:
         lambda_values.append(0.1)
+ax6.plot(lambda_values, 'b-', linewidth=2, label='\u03bb_coarse')
+ax6.axvline(x=epochs_coarse_stage, color='orange', linestyle=':', alpha=0.7)
+ax6.axvline(x=epochs_coarse_stage + epochs_main_stage, color='purple', linestyle=':', alpha=0.7)
+ax6.set_title('\u03bb_coarse Evolution (Curriculum)')
+ax6.set_xlabel('Iterations')
+ax6.set_ylabel('\u03bb_coarse')
+ax6.legend(fontsize='small')
+ax6.grid(True, alpha=0.3)
 
-ax12.plot(lambda_values, 'b-', linewidth=2, label='λ_coarse')
-ax12.axvline(x=epochs_coarse_stage, color='orange', linestyle=':', alpha=0.7)
-ax12.axvline(x=epochs_coarse_stage + epochs_main_stage, color='purple', linestyle=':', alpha=0.7)
-ax12.set_title('λ_coarse Evolution (Curriculum)')
-ax12.set_xlabel('Iterations')
-ax12.set_ylabel('λ_coarse')
-ax12.legend(fontsize='small')
-ax12.grid(True, alpha=0.3)
+# 7. Error histogram
+ax7 = plt.subplot(3, 4, 7)
+ax7.hist(per_probe_error, bins=100, alpha=0.7, color='steelblue', edgecolor='none')
+ax7.axvline(x=np.mean(per_probe_error), color='red', linestyle='--', 
+            label=f'Mean: {np.mean(per_probe_error):.6f}')
+ax7.axvline(x=np.median(per_probe_error), color='orange', linestyle='--',
+            label=f'Median: {np.median(per_probe_error):.6f}')
+ax7.set_title('Per-Probe MSE Distribution')
+ax7.set_xlabel('MSE')
+ax7.set_ylabel('Count')
+ax7.legend(fontsize='small')
+ax7.grid(True, alpha=0.3)
+ax7.set_yscale('log')
 
-# 13. Channel comparison (1D line)
-ax13 = plt.subplot(3, 5, 13)
-y_line = H // 2
-channel_colors = ['#E74C3C', '#27AE60', '#3498DB']
-channel_names = ['R', 'G', 'B']
-
-for c in range(C):
-    ax13.plot(gt_slice[y_line, :, c],
-              color=channel_colors[c], linestyle='-', alpha=0.6, linewidth=1.5,
-              label=f'GT {channel_names[c]}')
-    ax13.plot(rec_slice[y_line, :, c],
-              color=channel_colors[c], linestyle='--', alpha=0.9, linewidth=1.5,
-              label=f'Pred {channel_names[c]}')
-
-ax13.set_title(f'1D Fitting (Z={z_slice}, Y={y_line})')
-ax13.set_xlabel('X Coordinate')
-ax13.set_ylabel('Value')
-ax13.legend(loc='upper right', fontsize='x-small', ncol=2)
-ax13.grid(True, alpha=0.3)
-
-# 14. Fine Gaussian scale distribution
-ax14 = plt.subplot(3, 5, 14)
+# 8. Gaussian scale distribution
+ax8 = plt.subplot(3, 4, 8)
 fine_s_mean = fine_s.mean(axis=1)
-coeff_s = gaussian_params['coeff_s']
-coeff_s_mean = coeff_s.mean(axis=1)
-ax14.hist(coeff_s_mean, bins=15, alpha=0.6, color='blue', label=f'Coarse (M={model.M})', edgecolor='black')
-ax14.hist(fine_s_mean, bins=15, alpha=0.6, color='cyan', label=f'Fine (F={model.F})', edgecolor='black')
-ax14.set_title('Gaussian Scale Distribution')
-ax14.set_xlabel('Mean Scale')
-ax14.set_ylabel('Count')
-ax14.legend()
-ax14.grid(True, alpha=0.3)
+coeff_s_viz_mean = coeff_s_viz.mean(axis=1)
+basis_s_viz_mean = basis_s_viz.mean(axis=1)
+ax8.hist(coeff_s_viz_mean, bins=15, alpha=0.6, color='red', label=f'Coeff (M={model.M})', edgecolor='black')
+ax8.hist(basis_s_viz_mean, bins=15, alpha=0.6, color='blue', label=f'Basis (N={model.N})', edgecolor='black')
+ax8.hist(fine_s_mean, bins=15, alpha=0.6, color='cyan', label=f'Fine (F={model.F})', edgecolor='black')
+ax8.set_title('Gaussian Scale Distribution')
+ax8.set_xlabel('Mean Scale')
+ax8.set_ylabel('Count')
+ax8.legend(fontsize='small')
+ax8.grid(True, alpha=0.3)
 
-# 15. Summary information
-ax15 = plt.subplot(3, 5, 15)
-ax15.axis('off')
-num_probes = D * H * W
+# ===== Row 3: Detailed comparison and summary =====
 
-coeff_alpha = gaussian_params['coeff_alpha']
-basis_alpha = gaussian_params['basis_alpha']
+# 9. Sample probes: GT vs Reconstructed (line plot for first few probes)
+ax9 = plt.subplot(3, 4, 9)
+sample_indices = np.random.choice(N, 5, replace=False)
+for idx in sample_indices[:3]:
+    ax9.plot(ground_truth_np[idx], 'o-', markersize=2, alpha=0.5, linewidth=1)
+    ax9.plot(reconstructed[idx], 'x--', markersize=2, alpha=0.8, linewidth=1)
+ax9.set_title('Sample Probes: GT(o) vs Pred(x)\n27 SH channels')
+ax9.set_xlabel('Channel Index')
+ax9.set_ylabel('SH Coefficient')
+ax9.grid(True, alpha=0.3)
+
+# 10. Coarse vs Fine contribution analysis
+ax10 = plt.subplot(3, 4, 10)
+coarse_magnitude = np.abs(coarse_recon).mean(axis=1)  # [N]
+fine_magnitude = np.abs(fine_recon).mean(axis=1)      # [N]
+ratio_fine_coarse = fine_magnitude / (coarse_magnitude + 1e-8)
+ax10.hist(ratio_fine_coarse, bins=50, alpha=0.7, color='purple', edgecolor='none')
+ax10.axvline(x=np.median(ratio_fine_coarse), color='red', linestyle='--',
+             label=f'Median: {np.median(ratio_fine_coarse):.3f}')
+ax10.set_title('Fine/Coarse Magnitude Ratio')
+ax10.set_xlabel('|Fine| / |Coarse|')
+ax10.set_ylabel('Count')
+ax10.legend()
+ax10.grid(True, alpha=0.3)
+
+# 11. Per-SH-order PSNR/SSIM comparison
+ax11 = plt.subplot(3, 4, 11)
+order_names = []
+order_psnrs_final = []
+order_psnrs_coarse = []
+order_ssims_final = []
+order_ssims_coarse = []
+for sh_order, band_indices in sh_order_ranges:
+    order_channels = []
+    for band_idx in band_indices:
+        for color_idx in range(3):
+            order_channels.append(band_idx * 3 + color_idx)
+    order_psnrs_final.append(np.mean([psnr_values[c] for c in order_channels]))
+    order_psnrs_coarse.append(np.mean([coarse_psnr_values[c] for c in order_channels]))
+    order_ssims_final.append(np.mean([ssim_values[c] for c in order_channels]))
+    order_ssims_coarse.append(np.mean([coarse_ssim_values[c] for c in order_channels]))
+    order_names.append(f'L{sh_order}')
+
+x_pos_order = np.arange(len(order_names))
+width = 0.35
+# Main axis: PSNR bars
+ax11.bar(x_pos_order - width/2, order_psnrs_coarse, width, label='Coarse PSNR', color='orange', alpha=0.7)
+ax11.bar(x_pos_order + width/2, order_psnrs_final, width, label='Final PSNR', color='green', alpha=0.7)
+ax11.set_title('Per-SH-Order: PSNR & SSIM\nCoarse vs Final')
+ax11.set_xticks(x_pos_order)
+ax11.set_xticklabels(order_names)
+ax11.set_ylabel('PSNR (dB)')
+ax11.legend(loc='upper left', fontsize='x-small')
+ax11.grid(True, alpha=0.3, axis='y')
+# Secondary axis: SSIM line
+ax11b = ax11.twinx()
+ax11b.plot(x_pos_order, order_ssims_coarse, 'o--', color='darkorange', label='Coarse SSIM', markersize=6)
+ax11b.plot(x_pos_order, order_ssims_final, 's-', color='darkgreen', label='Final SSIM', markersize=6)
+ax11b.set_ylabel('SSIM')
+ax11b.set_ylim(0, 1.05)
+ax11b.legend(loc='upper right', fontsize='x-small')
+
+# 12. Summary information
+ax12 = plt.subplot(3, 4, 12)
+ax12.axis('off')
+
+coeff_alpha_viz = gaussian_params['coeff_alpha']
+basis_alpha_viz = gaussian_params['basis_alpha']
 mbd_scale = gaussian_params['mbd_scale']
 
 info_text = f"""
-Hierarchical MBD + Gaussian-Guided Fine Branch
+HI-NE-GBD SH Compression (ILCSampleData)
 ===============================================
-Original Data:
-  Volume: {D}x{H}x{W}x{C} = {num_probes} points
-  Size: {original_size/1024:.1f} KB
+Input Data:
+  Probes: {N} (scattered 3D positions)
+  SH Channels: {C} (9 bands \u00d7 3 RGB, interleaved)
+  Original Size: {original_size/1024:.1f} KB
 
 Model Architecture:
   Coarse (MBD): M={model.M}, N={model.N}, L={model.L}
-  MBD Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]
   Fine (Gaussian): F={model.F} anchors
   Fine (MLP): PE({model.pe_num_freqs}) + {model.mlp_hidden}h
-  Blending: Additive Residual (coarse + fine, no gate)
+  Blending: Additive Residual
   Total params: {branch_info['total']}
 
-Compression (float16 quantized):
-  FP32 Size: {comp_size_fp32/1024:.1f} KB ({comp_ratio_fp32:.1f}:1)
-  FP16 Size: {comp_size_fp16/1024:.1f} KB ({comp_ratio_fp16:.1f}:1)
-
-Fine Gaussian Statistics:
-  Alpha: {fine_alpha.mean():.3f} ± {fine_alpha.std():.3f}
-  Scale: {fine_s_mean.mean():.4f} ± {fine_s_mean.std():.4f}
+Compression (float16):
+  FP32: {comp_size_fp32/1024:.1f} KB ({comp_ratio_fp32:.1f}:1)
+  FP16: {comp_size_fp16/1024:.1f} KB ({comp_ratio_fp16:.1f}:1)
 
 Reconstruction Quality:
   Final PSNR: {psnr_value:.1f} dB
   Final SSIM: {ssim_value:.4f}
   Coarse PSNR: {coarse_psnr:.1f} dB
+  Coarse SSIM: {coarse_ssim:.4f}
+  Overall MSE: {overall_mse:.8f}
+  Relative Error: {relative_error:.6f}
 """
-ax15.text(0.02, 0.5, info_text, fontsize=8,
+ax12.text(0.02, 0.5, info_text, fontsize=8,
           family='monospace', verticalalignment='center')
 
-plt.suptitle('Hierarchical MBD with Gaussian-Guided Fine Branch (Coarse-to-Fine)', fontsize=16, y=1.01)
+plt.suptitle('HI-NE-GBD: SH Compression for ILC Light Probes', fontsize=14, y=1.01)
 plt.tight_layout()
+plt.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'HI-NE-GBD.png'), 
+            dpi=150, bbox_inches='tight')
 plt.show()
 
-print("\nDemo completed!")
+# ==================== Final Summary ====================
+print("\nSH Compression completed!")
 print("="*70)
-print("Hierarchical MBD with Gaussian-Guided Fine Branch")
+print("HI-NE-GBD: SH Compression for ILC Light Probes")
 print("="*70)
-print(f"Architecture:")
+print(f"Input: {N} probes \u00d7 {C} SH channels (ILCSampleData_0.bin)")
+print(f"  Position range: X[{pos_min[0]:.0f}, {pos_max[0]:.0f}], "
+      f"Y[{pos_min[1]:.0f}, {pos_max[1]:.0f}], Z[{pos_min[2]:.0f}, {pos_max[2]:.0f}]")
+print(f"\nArchitecture:")
 print(f"  [Coarse Branch] MBD with 3D Gaussians")
-print(f"    - Coefficient Gaussians: M={model.M} (position + scale + rotation + alpha)")
-print(f"    - Basis Gaussians: N={model.N} (position + scale + rotation + alpha)")
+print(f"    - Coefficient Gaussians: M={model.M}")
+print(f"    - Basis Gaussians: N={model.N}")
 print(f"    - Number of Bases: L={model.L}")
-print(f"    - MBD Learnable Scale: [{', '.join([f'{s:.3f}' for s in mbd_scale])}]")
 print(f"  [Fine Branch] Gaussian-Guided MLP")
-print(f"    - Fine Gaussians: F={model.F} (small-scale anchors)")
-print(f"    - Fine Gaussian Scale: {fine_s_mean.mean():.4f} (mean)")
-print(f"    - Fine Gaussian Alpha: {fine_alpha.mean():.3f} \u00b1 {fine_alpha.std():.3f}")
+print(f"    - Fine Gaussians: F={model.F}")
 print(f"    - PE frequencies: {model.pe_num_freqs}")
 print(f"    - Hidden size: {model.mlp_hidden}")
-print(f"  [Blending] Additive Residual (coarse + fine, no gate)")
-print(f"\nTraining Strategy (3 Stages):")
-print(f"  Stage 1: {epochs_coarse} epochs - Focus on Coarse (MBD)")
-print(f"  Stage 2: {epochs_main} epochs - Joint training (all branches)")
-print(f"  Stage 3: {epochs_fine} epochs - Focus on Fine (Gaussian+MLP)")
-print(f"\nResults:")
-print(f"  Compression (FP32): {comp_ratio_fp32:.1f}:1 ({comp_size_fp32/1024:.2f} KB)")
-print(f"  Compression (FP16): {comp_ratio_fp16:.1f}:1 ({comp_size_fp16/1024:.2f} KB)")
-print(f"  Final PSNR: {psnr_value:.1f} dB")
+print(f"  [Blending] Additive Residual (coarse + fine)")
+print(f"\nCompression Results:")
+print(f"  Original:  {original_size/1024:.1f} KB")
+print(f"  FP32:      {comp_size_fp32/1024:.1f} KB (ratio {comp_ratio_fp32:.1f}:1)")
+print(f"  FP16:      {comp_size_fp16/1024:.1f} KB (ratio {comp_ratio_fp16:.1f}:1)")
+print(f"\nReconstruction Quality:")
+print(f"  Final PSNR: {psnr_value:.2f} dB")
 print(f"  Final SSIM: {ssim_value:.4f}")
-print(f"  Coarse-only PSNR: {coarse_psnr:.1f} dB")
-print(f"  Blending: Additive Residual (coarse + fine, no gate)")
-print(f"  Coeff Alpha: {coeff_alpha.mean():.3f} \u00b1 {coeff_alpha.std():.3f}")
-print(f"  Basis Alpha: {basis_alpha.mean():.3f} \u00b1 {basis_alpha.std():.3f}")
-print(f"\nKey Innovations:")
-print(f"  1. Hierarchical decoding: MBD for low-freq + Gaussian+MLP for high-freq")
-print(f"  2. Fine Gaussians: Sparse anchors that learn high-frequency regions")
-print(f"  3. Gaussian-Guided MLP: Spatial awareness for local detail capture")
-print(f"  4. MBD Learnable Scale: Per-basis scale factors")
-print(f"  5. Positional Encoding: Better high-frequency learning")
-print(f"  6. Additive Residual Blending: coarse + fine (no gate overhead)")
-print(f"  7. Intermediate Supervision: Coarse branch also supervised")
-print(f"  8. Curriculum Learning: λ_coarse decay during training")
+print(f"  Coarse PSNR: {coarse_psnr:.2f} dB")
+print(f"  Coarse SSIM: {coarse_ssim:.4f}")
+print(f"  Overall MSE: {overall_mse:.8f}")
+print(f"  Relative Error: {relative_error:.6f}")
+print(f"\nPer-SH-Order PSNR/SSIM:")
+for i, (sh_order, _) in enumerate(sh_order_ranges):
+    print(f"  L{sh_order}: PSNR={order_psnrs_final[i]:.1f}dB, SSIM={order_ssims_final[i]:.4f} | "
+          f"Coarse: PSNR={order_psnrs_coarse[i]:.1f}dB, SSIM={order_ssims_coarse[i]:.4f}")
 print("="*70)

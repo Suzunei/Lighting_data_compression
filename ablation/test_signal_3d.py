@@ -580,6 +580,138 @@ def create_multiple_lights(grid_size=32, num_channels=3):
 
 
 # ============================================================
+# 16. 森林斑驳光照 SH 12D - Forest Dappled SH Order-1 (4 SH × 3 RGB)
+# ============================================================
+def create_forest_dappled_sh12d(grid_size=32, num_channels=12):
+    """
+    Forest dappled lighting decomposed into SH order-1 coefficients × RGB.
+    Channel layout: [L0_R, L1m1_R, L10_R, L1p1_R, L0_G, ..., L0_B, ...]
+    Total: 4 SH bases × 3 colors = 12 channels
+    """
+    num_channels = 12  # fixed
+    x = torch.linspace(-1, 1, grid_size)
+    y = torch.linspace(-1, 1, grid_size)
+    z = torch.linspace(-1, 1, grid_size)
+    X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+
+    signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
+
+    # Dappled light pattern (shared spatial modulator)
+    dapple = torch.abs(torch.sin(4.0 * np.pi * X) * torch.cos(3.5 * np.pi * Y) * torch.sin(3.0 * np.pi * Z))
+    dapple += 0.3 * torch.abs(torch.sin(5.0 * np.pi * (X + Z)) * torch.cos(4.5 * np.pi * Y))
+
+    # Per-color SH coefficient base intensities [R, G, B]
+    color_dc     = [0.55, 0.60, 0.42]   # L0: DC (ambient)
+    color_scale  = [0.30, 0.35, 0.20]   # dapple modulation strength
+    color_dir    = [0.12, 0.10, 0.08]   # L1: directional gradient strength
+
+    for ci, (dc, sc, dr) in enumerate(zip(color_dc, color_scale, color_dir)):
+        base = ci * 4  # channel offset for this color
+
+        # L0 (DC term): ambient + dappled pattern
+        signal[..., base + 0] = dc + sc * dapple
+        signal[..., base + 0] += 0.05 * torch.sin((1.2 + 0.3 * ci) * np.pi * Z)
+
+        # L1,-1 (Y-directional): vertical gradient with spatial variation
+        signal[..., base + 1] = dr * Y * (0.6 + 0.4 * dapple)
+        signal[..., base + 1] += 0.04 * torch.cos((2.0 + 0.2 * ci) * np.pi * X)
+
+        # L1,0 (Z-directional): depth gradient (canopy overhead → ground)
+        signal[..., base + 2] = dr * 1.2 * Z * (0.5 + 0.5 * dapple)
+        signal[..., base + 2] += 0.03 * torch.sin((1.8 + 0.3 * ci) * np.pi * Y)
+
+        # L1,+1 (X-directional): lateral sun direction
+        signal[..., base + 3] = dr * 0.8 * X * (0.7 + 0.3 * dapple)
+        signal[..., base + 3] += 0.05 * torch.cos((2.5 + 0.2 * ci) * np.pi * Z)
+
+    # Clamp all channels
+    for c in range(num_channels):
+        signal[..., c] = torch.clamp(signal[..., c], -0.9, 0.9)
+
+    return signal
+
+
+# ============================================================
+# 17. 森林斑驳光照 SH 27D - Forest Dappled SH Order-2 (9 SH × 3 RGB)
+# ============================================================
+def create_forest_dappled_sh27d(grid_size=32, num_channels=27):
+    """
+    Forest dappled lighting decomposed into SH order-2 coefficients × RGB.
+    Channel layout per color: [L0, L1m1, L10, L1p1, L2m2, L2m1, L20, L2p1, L2p2]
+    Total: 9 SH bases × 3 colors = 27 channels
+    """
+    num_channels = 27  # fixed
+    x = torch.linspace(-1, 1, grid_size)
+    y = torch.linspace(-1, 1, grid_size)
+    z = torch.linspace(-1, 1, grid_size)
+    X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+
+    signal = torch.zeros(grid_size, grid_size, grid_size, num_channels)
+
+    # Dappled light pattern
+    dapple = torch.abs(torch.sin(4.0 * np.pi * X) * torch.cos(3.5 * np.pi * Y) * torch.sin(3.0 * np.pi * Z))
+    dapple += 0.3 * torch.abs(torch.sin(5.0 * np.pi * (X + Z)) * torch.cos(4.5 * np.pi * Y))
+
+    # Secondary high-freq pattern for L2 terms
+    dapple2 = torch.abs(torch.cos(3.0 * np.pi * X) * torch.sin(4.0 * np.pi * Y))
+    dapple2 += 0.25 * torch.abs(torch.sin(5.5 * np.pi * Z) * torch.cos(3.8 * np.pi * X))
+
+    # Per-color intensities [R, G, B]
+    color_dc     = [0.55, 0.60, 0.42]   # L0 DC
+    color_scale  = [0.30, 0.35, 0.20]   # L0 dapple modulation
+    color_dir    = [0.12, 0.10, 0.08]   # L1 directional strength
+    color_quad   = [0.06, 0.05, 0.04]   # L2 quadratic strength
+
+    for ci, (dc, sc, dr, qd) in enumerate(zip(color_dc, color_scale, color_dir, color_quad)):
+        base = ci * 9  # channel offset
+
+        # ---- L=0 ----
+        # L0 (DC): ambient + dappled
+        signal[..., base + 0] = dc + sc * dapple
+        signal[..., base + 0] += 0.05 * torch.sin((1.2 + 0.3 * ci) * np.pi * Z)
+
+        # ---- L=1 ----
+        # L1,-1 (Y-dir)
+        signal[..., base + 1] = dr * Y * (0.6 + 0.4 * dapple)
+        signal[..., base + 1] += 0.04 * torch.cos((2.0 + 0.2 * ci) * np.pi * X)
+
+        # L1,0 (Z-dir)
+        signal[..., base + 2] = dr * 1.2 * Z * (0.5 + 0.5 * dapple)
+        signal[..., base + 2] += 0.03 * torch.sin((1.8 + 0.3 * ci) * np.pi * Y)
+
+        # L1,+1 (X-dir)
+        signal[..., base + 3] = dr * 0.8 * X * (0.7 + 0.3 * dapple)
+        signal[..., base + 3] += 0.05 * torch.cos((2.5 + 0.2 * ci) * np.pi * Z)
+
+        # ---- L=2 ----
+        # L2,-2: XY cross term (oblique anisotropy)
+        signal[..., base + 4] = qd * X * Y * (0.5 + 0.5 * dapple2)
+        signal[..., base + 4] += 0.03 * torch.sin((3.0 + 0.3 * ci) * np.pi * Z)
+
+        # L2,-1: YZ cross term (vertical-depth coupling)
+        signal[..., base + 5] = qd * 0.9 * Y * Z * (0.6 + 0.4 * dapple2)
+        signal[..., base + 5] += 0.02 * torch.cos((2.8 + 0.2 * ci) * np.pi * X)
+
+        # L2,0: Z²-dominated (canopy overhead concentration)
+        signal[..., base + 6] = qd * 1.1 * (3 * Z**2 - 1) / 2 * (0.4 + 0.6 * dapple)
+        signal[..., base + 6] += 0.04 * torch.sin((3.5 + 0.2 * ci) * np.pi * X) * torch.cos((2.0 + 0.3 * ci) * np.pi * Y)
+
+        # L2,+1: XZ cross term (sun-angle coupling)
+        signal[..., base + 7] = qd * 0.8 * X * Z * (0.5 + 0.5 * dapple2)
+        signal[..., base + 7] += 0.03 * torch.sin((2.5 + 0.3 * ci) * np.pi * Y)
+
+        # L2,+2: X²-Y² (horizontal anisotropy)
+        signal[..., base + 8] = qd * 0.7 * (X**2 - Y**2) * (0.4 + 0.6 * dapple2)
+        signal[..., base + 8] += 0.02 * torch.cos((3.2 + 0.2 * ci) * np.pi * Z)
+
+    # Clamp: L0 channels positive, L1/L2 channels can be negative
+    for c in range(num_channels):
+        signal[..., c] = torch.clamp(signal[..., c], -0.9, 0.9)
+
+    return signal
+
+
+# ============================================================
 # 测试信号索引字典
 # ============================================================
 TEST_SIGNALS = {
@@ -598,6 +730,8 @@ TEST_SIGNALS = {
     "hdr_skybox": create_hdr_skybox,
     "volumetric": create_volumetric_light,
     "multiple_lights": create_multiple_lights,
+    "forest_dappled_sh12d": create_forest_dappled_sh12d,
+    "forest_dappled_sh27d": create_forest_dappled_sh27d,
 }
 
 

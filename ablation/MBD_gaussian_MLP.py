@@ -492,48 +492,40 @@ def compute_psnr(img1, img2):
     psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
     return psnr
 
-def compute_ssim(img1, img2, window_size=11):
-    """Compute SSIM for multi-channel images"""
+def compute_ssim(img1, img2, window_size=7):
+    """Compute SSIM (Wang et al. 2004) with proper Gaussian window and dynamic range."""
     from scipy.signal import fftconvolve
-    from numpy import asarray, prod
 
     img1 = img1.astype(np.float64)
     img2 = img2.astype(np.float64)
 
-    # Process multi-channel images: compute SSIM for each channel separately, then average
     if img1.ndim == 3:
-        ssim_channels = []
-        for c in range(img1.shape[2]):
-            ssim_c = compute_ssim(img1[:, :, c], img2[:, :, c], window_size)
-            ssim_channels.append(ssim_c)
-        return np.mean(ssim_channels)
+        return np.mean([compute_ssim(img1[:,:,c], img2[:,:,c], window_size)
+                        for c in range(img1.shape[2])])
 
-    # Generate Gaussian window
+    sigma = 1.5
+    coords = np.arange(window_size) - window_size // 2
     gaussian = np.outer(
-        np.exp(-(np.arange(window_size) - window_size//2)**2 / 1.5),
-        np.exp(-(np.arange(window_size) - window_size//2)**2 / 1.5)
+        np.exp(-coords**2 / (2 * sigma**2)),
+        np.exp(-coords**2 / (2 * sigma**2))
     )
     gaussian /= gaussian.sum()
 
-    # Compute local statistics
-    def filter_window(x):
+    def filt(x):
         return fftconvolve(x, gaussian, mode='valid')
 
-    mu1 = filter_window(img1)
-    mu2 = filter_window(img2)
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
+    mu1, mu2 = filt(img1), filt(img2)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1*mu1, mu2*mu2, mu1*mu2
 
-    sigma1_sq = filter_window(img1*img1) - mu1_sq
-    sigma2_sq = filter_window(img2*img2) - mu2_sq
-    sigma12 = filter_window(img1*img2) - mu1_mu2
+    sigma1_sq = np.maximum(filt(img1*img1) - mu1_sq, 0)
+    sigma2_sq = np.maximum(filt(img2*img2) - mu2_sq, 0)
+    sigma12 = filt(img1*img2) - mu1_mu2
 
-    # SSIM formula
-    C1 = (0.01 * 1.0) ** 2
-    C2 = (0.03 * 1.0) ** 2
+    L = max(img1.max() - img1.min(), img2.max() - img2.min(), 1e-8)
+    C1 = (0.01 * L) ** 2
+    C2 = (0.03 * L) ** 2
 
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+    ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / \
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
     return np.mean(ssim_map)
