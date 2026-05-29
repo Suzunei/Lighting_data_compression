@@ -1354,3 +1354,37 @@ for i, (sh_order, _) in enumerate(sh_order_ranges):
     print(f"  L{sh_order}: PSNR={order_psnrs_final[i]:.1f}dB, SSIM={order_ssims_final[i]:.4f} | "
           f"Coarse: PSNR={order_psnrs_coarse[i]:.1f}dB, SSIM={order_ssims_coarse[i]:.4f}")
 print("="*70)
+
+# ==================== Step 4: Save Compressed Model for Real-time Decoding ====================
+print("\nStep 4: Saving compressed model for real-time decoding...")
+
+from decoder import save_compressed_model
+
+# 模型配置（与创建模型时的参数一致）
+model_config = {
+    'num_bases': 16,
+    'coeff_res': 64,
+    'basis_res': 64,
+    'data_dim': C,
+    'coeff_kernel_scale': 0.12,
+    'basis_kernel_scale': 0.18,
+    'mlp_hidden': 128,
+    'pe_num_freqs': 6,
+    'fine_mlp_depth': 3,
+    'fine_gaussian_res': 32,
+    'fine_kernel_scale': 0.05
+}
+
+save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'compressed_model.pth')
+save_compressed_model(
+    model=model,
+    save_path=save_path,
+    model_config=model_config,
+    pos_min=pos_min,
+    pos_max=pos_max,
+    num_probes=N,
+    use_fp16=True
+)
+
+print(f"\n[提示] 使用以下命令进行实时解压:")
+print(f"  python decoder.py --model compressed_model.pth --interactive")
