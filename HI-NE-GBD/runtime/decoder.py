@@ -32,6 +32,10 @@ import argparse
 import json
 import time
 
+# ==================== 全局配置 ====================
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'compressed_model.pth')  # 模型文件路径
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'  # 推理设备: 'cuda' 或 'cpu'
+
 
 # ==================== 模型定义（与训练代码保持一致） ====================
 
@@ -525,11 +529,11 @@ def interactive_mode(decoder):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HI-NE-GBD 实时解压器")
-    parser.add_argument("--model", type=str, default="compressed_model.pth",
-                        help="压缩模型文件路径 (默认: compressed_model.pth)")
-    parser.add_argument("--device", type=str, default="cpu",
+    parser.add_argument("--model", type=str, default=MODEL_PATH,
+                        help=f"压缩模型文件路径 (默认: {MODEL_PATH})")
+    parser.add_argument("--device", type=str, default=DEVICE,
                         choices=["cpu", "cuda"],
-                        help="推理设备 (默认: cpu)")
+                        help=f"推理设备 (默认: {DEVICE})")
     parser.add_argument("--interactive", action="store_true",
                         help="进入交互式解压模式")
     parser.add_argument("--benchmark", action="store_true",
@@ -548,7 +552,7 @@ if __name__ == "__main__":
     
     if not os.path.exists(model_path):
         print(f"[错误] 模型文件不存在: {model_path}")
-        print(f"  请先运行 HI-NE-GBD.py 完成训练并保存模型。")
+        print(f"  请先运行 buildtime/HI-NE-GBD.py 完成训练并保存模型。")
         exit(1)
     
     # 初始化解压器

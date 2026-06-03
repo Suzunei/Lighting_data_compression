@@ -198,7 +198,7 @@ class ProbeReader:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ILCSampleData 探针数据读取器")
     parser.add_argument("--bin", type=str, default="ILCSampleData_0.bin",
-                        help="探针二进制文件路径 (默认: ILCSampleData_0.bin)")
+                        help="探针二进制文件路径 (默认: ../probedata/ILCSampleData_0.bin)")
     parser.add_argument("--random", type=int, default=1,
                         help="随机返回 N 个探针 (默认: 1)")
     parser.add_argument("--index", type=int, default=None,
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     # 解析文件路径
     bin_path = args.bin
     if not os.path.isabs(bin_path):
-        bin_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), bin_path)
+        bin_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'probedata', bin_path)
     
     # 加载数据
     reader = ProbeReader(bin_path)

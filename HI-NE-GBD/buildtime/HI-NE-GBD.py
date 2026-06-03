@@ -5,6 +5,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
+import sys
 
 #运行指令：$env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 #python MBD.py 2>&1
@@ -81,7 +82,7 @@ def load_ilc_probe_data(bin_path):
     return positions_normalized, sh_coeffs, radii, shadows, pos_min, pos_max
 
 # ===== 加载探针数据 =====
-BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ILCSampleData_0.bin')
+BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'probedata', 'ILCSampleData_0.bin')
 positions_np, sh_coeffs_np, radii_np, shadows_np, pos_min, pos_max = load_ilc_probe_data(BIN_PATH)
 
 # 转为PyTorch张量
@@ -1358,6 +1359,7 @@ print("="*70)
 # ==================== Step 4: Save Compressed Model for Real-time Decoding ====================
 print("\nStep 4: Saving compressed model for real-time decoding...")
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'runtime'))
 from decoder import save_compressed_model
 
 # 模型配置（与创建模型时的参数一致）
@@ -1375,7 +1377,7 @@ model_config = {
     'fine_kernel_scale': 0.05
 }
 
-save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'compressed_model.pth')
+save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'runtime', 'compressed_model.pth')
 save_compressed_model(
     model=model,
     save_path=save_path,
@@ -1387,4 +1389,4 @@ save_compressed_model(
 )
 
 print(f"\n[提示] 使用以下命令进行实时解压:")
-print(f"  python decoder.py --model compressed_model.pth --interactive")
+print(f"  python ../runtime/decoder.py --model ../runtime/compressed_model.pth --interactive")

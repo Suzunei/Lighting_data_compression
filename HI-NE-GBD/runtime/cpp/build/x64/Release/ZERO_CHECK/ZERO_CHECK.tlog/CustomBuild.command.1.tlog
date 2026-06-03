@@ -1,0 +1,10 @@
+^F:\WORKSPACE\TENCENT_PROJECT\MBD\HI-NE-GBD\RUNTIME\CPP\BUILD\CMAKEFILES\C39FB8BBF49C41258BCA8620A4EB4803\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SF:/WorkSpace/Tencent_project/MBD/HI-NE-GBD/runtime/cpp -BF:/WorkSpace/Tencent_project/MBD/HI-NE-GBD/runtime/cpp/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file F:/WorkSpace/Tencent_project/MBD/HI-NE-GBD/runtime/cpp/build/HINEGBD.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
