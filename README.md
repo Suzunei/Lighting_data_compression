@@ -1,7 +1,7 @@
-Used moving gaussian decomposition and mlp to compress the pre-computed light transport data - light-probe
-Reference: 
-1.Moving Basis Decomposition for Precomputed Light Transport（EGSR 2021）
-2.Gaussian Compression for Precomputed Indirect Illumination（SIGGRAPH 2025）
+Used moving gaussian decomposition and mlp to compress the pre-computed light transport data - light-probe  
+Reference:   
+1.Moving Basis Decomposition for Precomputed Light Transport（EGSR 2021）  
+2.Gaussian Compression for Precomputed Indirect Illumination（SIGGRAPH 2025）  
 
 # HI-NE-GBD: Hierarchical Neural-Enhanced Gaussian Basis Decomposition
 
