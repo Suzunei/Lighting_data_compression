@@ -3,7 +3,7 @@ Reference:
 1.Moving Basis Decomposition for Precomputed Light Transport（EGSR 2021）  
 2.Gaussian Compression for Precomputed Indirect Illumination（SIGGRAPH 2025）  
 
-# HI-NE-GBD: Hierarchical Neural-Enhanced Gaussian Basis Decomposition
+# HI-NE-GBD: Hierarchical Neural Gaussian Basis Decomposition
 
 A hierarchical Gaussian-guided Moving Basis Decomposition (MBD) method for efficient compression and real-time decompression of Spherical Harmonics (SH) coefficients from light probes.
 
