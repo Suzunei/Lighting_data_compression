@@ -24,44 +24,137 @@
 
 HI-NE-GBD 采用 **Coarse-to-Fine（粗到细）层级解码架构**，把光照数据拆为低频全局光照分支与高频局部细节分支，在高压缩比下仍能保持高质量重建。
 
-### 核心结构
+### 核心方程
 
+$$
+f_{\text{final}}(\mathbf{x}) = \underbrace{f_{\text{coarse}}(\mathbf{x})}_{\text{MBD 低频}} + \underbrace{f_{\text{fine}}(\mathbf{x})}_{\text{高斯引导 MLP}} + 0.1 \cdot \underbrace{r(\mathbf{x})}_{\text{27 维精修器}}
+$$
+
+### 数据流与通道维度
+
+下图追踪一批 $B$ 个探针在网络中的流动。**边上的标注就是张量形状** —— 每一处通道维度变化都标了出来：
+
+```mermaid
+flowchart TD
+    INPUT["coords<br/><b>[B, 3]</b>"]:::input
+
+    INPUT --> PE["位置编码<br/>3 + 3·2·6 个频率"]:::op
+    INPUT --> COEFF_G["系数高斯<br/>M = 64 个锚点"]:::op
+    INPUT --> BASIS_G["基函数高斯<br/>N = 64 个锚点"]:::op
+    INPUT --> FINE_G["Fine 高斯<br/>F = 32 个锚点"]:::op
+
+    PE -->|"[B, 39]"| CAT
+    FINE_G -->|"φ_fine<br/>[B, 32]"| CAT["concat"]:::op
+    FINE_G -->|"φ_fine<br/>[B, 32]"| FINTERP["× fine_features<br/>[32, 27]"]:::op
+
+    CAT -->|"[B, 71]"| FMLP["fine_mlp<br/>71→128→128→128→27"]:::mlp
+    FMLP -->|"[B, 27]"| FADD(("+"))
+    FINTERP -->|"[B, 27]<br/>× 0.2"| FADD
+    FADD -->|"f_fine<br/><b>[B, 27]</b>"| BLEND(("+"))
+
+    COEFF_G -->|"φ<br/>[B, 64]"| MC["× C<br/>[64, 16]"]:::op
+    BASIS_G -->|"ψ<br/>[B, 64]"| MB["× B<br/>[64, 16, 27]"]:::op
+    MC -->|"c_l(x)<br/>[B, 16]"| MBD["MBD 归约<br/>Σ_l scale_l · c_l · b_l"]:::op
+    MB -->|"b_l(x)<br/>[B, 16, 27]"| MBD
+    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND
+
+    BLEND -->|"blended<br/>[B, 27]"| REFCAT["与 coords 拼接"]:::op
+    INPUT -.->|"[B, 3]"| REFCAT
+    REFCAT -->|"[B, 30]"| REF["residual_refiner<br/>30→64→27"]:::mlp
+    BLEND -->|"[B, 27]"| FINAL(("+"))
+    REF -->|"[B, 27]<br/>× 0.1"| FINAL
+    FINAL -->|"<b>[B, 27]</b>"| OUT["SH 系数<br/>9 阶 × RGB"]:::output
+
+    classDef input fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef output fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef op fill:#fff9c4,stroke:#f57f17
+    classDef mlp fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
 ```
-f_final(x) = f_coarse(x) + f_fine(x) + 0.1 * residual(x)
+
+> [!NOTE]
+> 三个独立维度并存：
+> **锚点数** (M=64, N=64, F=32) — 每个分支用多少高斯核 ·
+> **基数量** (L=16) — MBD 类似秩分解的宽度 ·
+> **数据维度** (D=27) — 9 阶 SH × 3 RGB（交错存储）。
+
+### 各分支详解
+
+#### Coarse 分支 — 带 3D 高斯的 MBD
+
+$$
+f_{\text{coarse}}(\mathbf{x}) = \sum_{l=1}^{L} s_l \cdot c_l(\mathbf{x}) \cdot \mathbf{b}_l(\mathbf{x}), \quad
+c_l(\mathbf{x}) = \sum_{m=1}^{M} \varphi_m(\mathbf{x})\, C_{m,l}, \quad
+\mathbf{b}_l(\mathbf{x}) = \sum_{n=1}^{N} \psi_n(\mathbf{x})\, \mathbf{B}_{n,l}
+$$
+
+每个高斯都带完整协方差参数：`position(3) + log_scale(3) + quaternion(4) + alpha(1)` —— 各向异性、可旋转、强度可调。
+
+#### Fine 分支 — 高斯引导 MLP
+
+$$
+f_{\text{fine}}(\mathbf{x}) = \text{MLP}\!\big(\text{PE}(\mathbf{x}) \,\Vert\, \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\big) + 0.2 \cdot \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\, F
+$$
+
+Fine 高斯（$F=32$ 个）是稀疏锚点，自适应学习高频区域；它们的权重作为 MLP 的条件输入，在位置编码之上额外提供空间感知。
+
+#### 残差精修器 — 27 维跨通道修正
+
+一个小 MLP `[B,30] → [B,27]`，读取融合后的输出，修正 fine 分支看不见的、按通道相关的系统性偏差。
+
+> [!IMPORTANT]
+> **精修器并非冗余设计。** 参数对齐的消融（3 seeds × 3 变体 @ 约 80,750 参数）证明：相同参数预算下，把它换成更多 fine 高斯或更宽的 MLP，PSNR 都会**下降 0.55 ~ 1.07 dB** —— 详见[§ 消融研究：每个组件为何保留](#消融研究每个组件为何保留)。
+
+### 训练策略 — 三阶段课程学习
+
+```mermaid
+gantt
+    title Coarse-to-Fine 训练（共 3500 epoch）
+    dateFormat X
+    axisFormat %s
+
+    section Stage 1 — Coarse Focus
+    仅 MBD 分支 · λ_c = 0.5  :s1, 0, 500
+
+    section Stage 2 — Joint Training
+    全部分支 · λ_c 衰减 0.5→0.1   :s2, 500, 2500
+
+    section Stage 3 — Fine Focus
+    Fine + MLP + 精修器 · λ_c = 0.1   :s3, 3000, 500
 ```
 
-**Coarse 分支（带 3D 高斯的 MBD）**：
-- 用可学习的 3D 各向异性高斯核做空间插值
-- Moving Basis Decomposition：`f_coarse(x) = Σ_l scale_l * c_l(x) * b_l(x)`
-- 系数高斯（M）+ 基函数高斯（N）
-- 每个高斯有完整协方差参数：position(3) + log_scale(3) + quaternion(4) + alpha(1)
-
-**Fine 分支（高斯引导 MLP）**：
-- Fine Gaussians (F)：稀疏锚点，自适应定位高频细节区域（边缘、阴影等）
-- MLP 输入 = 位置编码(coords) + Fine 高斯权重（提供空间感知）
-- 直接用高斯插值后的 features 作为补充细节源
-- `f_fine(x) = MLP(PE(x), φ_fine(x)) + 0.2 * Σ φ_fine(x) * features`
-
-**残差精修器**：
-- 一个小 MLP，对融合后的输出做残差修正
-
-### 训练策略（三阶段 Coarse-to-Fine）
-
-| 阶段 | Epochs | 策略 | 说明 |
-|------|--------|------|------|
-| Stage 1 | 500 | Coarse Focus | 只更新 MBD 分支，λ_coarse 权重高 |
-| Stage 2 | 2500 | Joint Training | 所有分支联合训练，λ_coarse 渐降（Curriculum Learning）|
-| Stage 3 | 500 | Fine Focus | 聚焦 Fine 高斯 + MLP，λ_coarse 权重低 |
+| 阶段 | Epochs | 优化目标 | $\lambda_{\text{coarse}}$ |
+|:----:|-------:|---------|:------------------------:|
+| 1 | 500  | 仅 Coarse 高斯 + MBD 张量 | 0.5（高） |
+| 2 | 2500 | 全部分支联合训练           | 0.5 → 0.1（衰减） |
+| 3 | 500  | Fine 高斯 + Fine MLP + 精修器 | 0.1（低） |
 
 ### 损失函数
 
-```
-L_total = L_final + λ_coarse * L_coarse + λ_reg * L_reg
-```
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{final}} + \lambda_{\text{coarse}} \cdot \mathcal{L}_{\text{coarse}} + \lambda_{\text{reg}} \cdot \mathcal{L}_{\text{reg}}
+$$
 
-- **L_final**：最终重建 MSE（支持按通道方差倒数加权）
-- **L_coarse**：对 Coarse 分支的中间监督，鼓励 MBD 独立学到低频表征
-- **L_reg**：正则项，防止尺度爆炸
+- $\mathcal{L}_{\text{final}}$：重建 MSE —— 通道权重 $w_c \propto 1/\sigma_c^2$ 平衡各阶 SH 上的梯度。
+- $\mathcal{L}_{\text{coarse}}$：对 MBD 分支做中间监督，让它专注学习低频。
+- $\mathcal{L}_{\text{reg}}$：高斯尺度的 L2 正则，防止 scale 爆炸。
+
+### 消融研究：每个组件为何保留
+
+<details>
+<summary><b>点击展开</b> — 残差精修器的参数对齐消融</summary>
+
+为了检验残差精修器是不是"浪费的参数"，我们做了参数对齐的消融：每个变体约 80,750 个可训练参数，3 seed × 3500 epoch + FP16 量化，真实探针数据。
+
+| 变体 | 描述 | PSNR (mean ± std) | SSIM | 参数 |
+|------|------|------------------:|:----:|-----:|
+| **A**：保留精修器 | F=32, h=128, +residual_refiner（生产配置） | **40.32 ± 0.49** | **0.9482** | 80,774 |
+| B：更多 fine 高斯 | F=54, h=128, 不带精修器 | 39.25 ± 0.61 | 0.9348 | 80,687 |
+| C：更宽 fine MLP   | F=32, h=134, 不带精修器 | 39.85 ± 0.07 | 0.9409 | 80,785 |
+| D：fine 看到 coarse | fine_mlp 输入加上 coarse_output，不带精修器 | 39.55 ± 0.45 | 0.9353 | 80,491 |
+
+**精修器在三组对照中全部胜出**：领先 B 1.07 dB、C 0.47 dB、D 0.77 dB。把同样的参数预算换到更宽/更密的 fine 层都补不回来 —— 精修器占据了结构上独一无二的位置：它是模型里**唯一能看到 27 维融合输出**、能修正跨通道相关误差（例如 L0_R 和 L0_G 一同偏移）的组件，而坐标条件化的 fine MLP 看不见这种模式。
+
+</details>
 
 ## 数据格式
 

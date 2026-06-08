@@ -24,44 +24,137 @@ A hierarchical Gaussian-guided Moving Basis Decomposition (MBD) method for effic
 
 HI-NE-GBD employs a **Coarse-to-Fine hierarchical decoding architecture** that decomposes lighting data into a low-frequency global illumination branch and a high-frequency local detail branch, achieving high-quality reconstruction under high compression ratios.
 
-### Core Architecture
+### Core Equation
 
+$$
+f_{\text{final}}(\mathbf{x}) = \underbrace{f_{\text{coarse}}(\mathbf{x})}_{\text{MBD low-freq}} + \underbrace{f_{\text{fine}}(\mathbf{x})}_{\text{Gaussian-guided MLP}} + 0.1 \cdot \underbrace{r(\mathbf{x})}_{\text{27-dim refiner}}
+$$
+
+### Data Flow & Channel Dimensions
+
+The diagram below traces a query of $B$ probes through the network. **Edge labels are tensor shapes** — every transformation that changes the channel count is annotated:
+
+```mermaid
+flowchart TD
+    INPUT["coords<br/><b>[B, 3]</b>"]:::input
+
+    INPUT --> PE["Positional Encoding<br/>3 + 3·2·6 freqs"]:::op
+    INPUT --> COEFF_G["Coeff Gaussians<br/>M = 64 anchors"]:::op
+    INPUT --> BASIS_G["Basis Gaussians<br/>N = 64 anchors"]:::op
+    INPUT --> FINE_G["Fine Gaussians<br/>F = 32 anchors"]:::op
+
+    PE -->|"[B, 39]"| CAT
+    FINE_G -->|"φ_fine<br/>[B, 32]"| CAT["concat"]:::op
+    FINE_G -->|"φ_fine<br/>[B, 32]"| FINTERP["× fine_features<br/>[32, 27]"]:::op
+
+    CAT -->|"[B, 71]"| FMLP["fine_mlp<br/>71→128→128→128→27"]:::mlp
+    FMLP -->|"[B, 27]"| FADD(("+"))
+    FINTERP -->|"[B, 27]<br/>× 0.2"| FADD
+    FADD -->|"f_fine<br/><b>[B, 27]</b>"| BLEND(("+"))
+
+    COEFF_G -->|"φ<br/>[B, 64]"| MC["× C<br/>[64, 16]"]:::op
+    BASIS_G -->|"ψ<br/>[B, 64]"| MB["× B<br/>[64, 16, 27]"]:::op
+    MC -->|"c_l(x)<br/>[B, 16]"| MBD["MBD reduce<br/>Σ_l scale_l · c_l · b_l"]:::op
+    MB -->|"b_l(x)<br/>[B, 16, 27]"| MBD
+    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND
+
+    BLEND -->|"blended<br/>[B, 27]"| REFCAT["concat with coords"]:::op
+    INPUT -.->|"[B, 3]"| REFCAT
+    REFCAT -->|"[B, 30]"| REF["residual_refiner<br/>30→64→27"]:::mlp
+    BLEND -->|"[B, 27]"| FINAL(("+"))
+    REF -->|"[B, 27]<br/>× 0.1"| FINAL
+    FINAL -->|"<b>[B, 27]</b>"| OUT["SH coefficients<br/>9 bands × RGB"]:::output
+
+    classDef input fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef output fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef op fill:#fff9c4,stroke:#f57f17
+    classDef mlp fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
 ```
-f_final(x) = f_coarse(x) + f_fine(x) + 0.1 * residual(x)
+
+> [!NOTE]
+> Three independent dimensions co-exist:
+> **anchor count** (M=64, N=64, F=32) — how many Gaussian kernels per branch ·
+> **basis count** (L=16) — MBD's rank-like factorization width ·
+> **data dim** (D=27) — 9 SH bands × 3 RGB channels (interleaved).
+
+### Branch Details
+
+#### Coarse Branch — MBD with 3D Gaussians
+
+$$
+f_{\text{coarse}}(\mathbf{x}) = \sum_{l=1}^{L} s_l \cdot c_l(\mathbf{x}) \cdot \mathbf{b}_l(\mathbf{x}), \quad
+c_l(\mathbf{x}) = \sum_{m=1}^{M} \varphi_m(\mathbf{x})\, C_{m,l}, \quad
+\mathbf{b}_l(\mathbf{x}) = \sum_{n=1}^{N} \psi_n(\mathbf{x})\, \mathbf{B}_{n,l}
+$$
+
+Each Gaussian carries full covariance parameters: `position(3) + log_scale(3) + quaternion(4) + alpha(1)` — anisotropic, rotatable, intensity-weighted.
+
+#### Fine Branch — Gaussian-Guided MLP
+
+$$
+f_{\text{fine}}(\mathbf{x}) = \text{MLP}\!\big(\text{PE}(\mathbf{x}) \,\Vert\, \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\big) + 0.2 \cdot \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\, F
+$$
+
+Fine Gaussians ($F=32$) are sparse anchors that learn to locate high-frequency regions; their weights condition the MLP, providing spatial awareness on top of positional encoding.
+
+#### Residual Refiner — 27-dim Cross-Channel Correction
+
+A small MLP `[B,30] → [B,27]` that reads the blended output and patches systematic per-channel biases the fine branch can't see.
+
+> [!IMPORTANT]
+> **The refiner is not redundant.** A parameter-matched ablation (3 seeds × 3 variants @ ~80,750 params) shows it contributes **+0.55 to +1.07 dB PSNR** vs. spending the same budget on more fine Gaussians or a wider MLP — see [§ Ablation: Why Each Component Stays](#ablation-why-each-component-stays).
+
+### Training Strategy — Three-Stage Curriculum
+
+```mermaid
+gantt
+    title Coarse-to-Fine Training (3500 epochs total)
+    dateFormat X
+    axisFormat %s
+
+    section Stage 1 — Coarse Focus
+    MBD branch only · λ_c = 0.5  :s1, 0, 500
+
+    section Stage 2 — Joint Training
+    All branches · λ_c decays 0.5→0.1   :s2, 500, 2500
+
+    section Stage 3 — Fine Focus
+    Fine + MLP + Refiner · λ_c = 0.1   :s3, 3000, 500
 ```
 
-**Coarse Branch (MBD with 3D Gaussians)**:
-- Uses learnable 3D anisotropic Gaussian kernels for spatial interpolation
-- Moving Basis Decomposition: `f_coarse(x) = Σ_l scale_l * c_l(x) * b_l(x)`
-- Coefficient Gaussians (M) + Basis Gaussians (N)
-- Each Gaussian has full covariance parameters: position(3) + log_scale(3) + quaternion(4) + alpha(1)
+| Stage | Epochs | What's optimised | $\lambda_{\text{coarse}}$ |
+|:-----:|-------:|------------------|:------------------------:|
+| 1 | 500  | Coarse Gaussians + MBD tensors only | 0.5 (high) |
+| 2 | 2500 | All branches jointly                 | 0.5 → 0.1 (decay) |
+| 3 | 500  | Fine Gaussians + Fine MLP + Refiner  | 0.1 (low) |
 
-**Fine Branch (Gaussian-Guided MLP)**:
-- Fine Gaussians (F): Sparse anchors that learn to locate high-frequency detail regions (edges, shadows, etc.)
-- MLP input = Positional Encoding(coords) + Fine Gaussian weights (spatial awareness)
-- Direct Gaussian-interpolated features as supplementary detail source
-- `f_fine(x) = MLP(PE(x), φ_fine(x)) + 0.2 * Σ φ_fine(x) * features`
+### Loss
 
-**Residual Refiner**:
-- A small MLP that performs residual correction on the blended output
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{final}} + \lambda_{\text{coarse}} \cdot \mathcal{L}_{\text{coarse}} + \lambda_{\text{reg}} \cdot \mathcal{L}_{\text{reg}}
+$$
 
-### Training Strategy (Three-Stage Coarse-to-Fine)
+- $\mathcal{L}_{\text{final}}$: reconstruction MSE — channel weights $w_c \propto 1/\sigma_c^2$ balance gradients across SH orders.
+- $\mathcal{L}_{\text{coarse}}$: intermediate supervision pinning the MBD branch on the low-frequency target.
+- $\mathcal{L}_{\text{reg}}$: scale-norm regulariser preventing Gaussian-scale explosion.
 
-| Stage | Epochs | Strategy | Description |
-|-------|--------|----------|-------------|
-| Stage 1 | 500 | Coarse Focus | Only update MBD branch, high λ_coarse weight |
-| Stage 2 | 2500 | Joint Training | Train all branches jointly, λ_coarse decays gradually (Curriculum Learning) |
-| Stage 3 | 500 | Fine Focus | Focus on Fine Gaussians + MLP, low λ_coarse weight |
+### Ablation: Why Each Component Stays
 
-### Loss Function
+<details>
+<summary><b>Click to expand</b> — parameter-matched ablation of the residual refiner</summary>
 
-```
-L_total = L_final + λ_coarse * L_coarse + λ_reg * L_reg
-```
+To check whether the residual refiner is "wasted parameters," we ran a parameter-matched ablation: each variant has ~80,750 trainable params, 3 seeds × 3500 epochs + FP16 quantization, real probe data.
 
-- **L_final**: Final reconstruction MSE (supports per-channel variance-inverse weighting)
-- **L_coarse**: Intermediate supervision on the coarse branch, encouraging MBD to independently learn low-frequency representation
-- **L_reg**: Regularization term to prevent scale explosion
+| Variant | Description | PSNR (mean ± std) | SSIM | Params |
+|---------|-------------|------------------:|:----:|-------:|
+| **A**: with refiner | F=32, h=128, +residual_refiner (production) | **40.32 ± 0.49** | **0.9482** | 80,774 |
+| B: more fine Gaussians | F=54, h=128, no refiner | 39.25 ± 0.61 | 0.9348 | 80,687 |
+| C: wider fine MLP    | F=32, h=134, no refiner | 39.85 ± 0.07 | 0.9409 | 80,785 |
+| D: fine sees coarse  | fine_mlp gets coarse_output as input, no refiner | 39.55 ± 0.45 | 0.9353 | 80,491 |
+
+**The refiner wins all three pairings**: +1.07 dB over B, +0.47 dB over C, +0.77 dB over D. Reallocating the same budget into wider/denser fine layers cannot recover the gain — the refiner occupies a structurally unique position: it is the only component that sees the **27-dim blended output** and can correct cross-channel correlated errors (e.g., L0_R and L0_G drifting together) that the coordinate-conditioned fine MLP can't observe.
+
+</details>
 
 ## Data Format
 
