@@ -1,11 +1,24 @@
-Used moving gaussian decomposition and mlp to compress the pre-computed light transport data - light-probe  
-Reference:   
-1.Moving Basis Decomposition for Precomputed Light Transport（EGSR 2021）  
-2.Gaussian Compression for Precomputed Indirect Illumination（SIGGRAPH 2025）  
+<!-- LANG-SWITCH -->
+**Language**: **English** · [简体中文](README.zh-CN.md)
+
+> [!IMPORTANT]
+> README is maintained in two languages ([`README.md`](README.md) canonical · [`README.zh-CN.md`](README.zh-CN.md) mirror). **Any change must update both in the same commit.**
+
+---
 
 # HI-NE-GBD: Hierarchical Neural Gaussian Basis Decomposition
 
+[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A51.10-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](HI-NE-GBD/runtime/cpp/)
+
+> **Compress pre-computed light-probe SH coefficients with a hierarchical Gaussian-guided neural decoder, decompress in real time.**
+
 A hierarchical Gaussian-guided Moving Basis Decomposition (MBD) method for efficient compression and real-time decompression of Spherical Harmonics (SH) coefficients from light probes.
+
+**References**:
+1. *Moving Basis Decomposition for Precomputed Light Transport* (EGSR 2021)
+2. *Gaussian Compression for Precomputed Indirect Illumination* (SIGGRAPH 2025)
 
 ## Method Overview
 
@@ -84,9 +97,13 @@ Contains all learnable parameters (FP16 quantized storage), supporting real-time
 │   │       └── CMakeLists.txt
 │   └── probedata/
 │       └── ILCSampleData_0.bin   #   Light probe raw data (only copy)
-├── experiments/                  # Research / ablation scripts (synthetic signals)
-│   ├── ablation/                 #   Component ablations + per-experiment .png
-│   └── legacy/                   #   Earlier exploratory scripts
+├── experiments/
+│   ├── ablation/                 # Component ablations (mostly synthetic signals)
+│   │   ├── HI-NE-GBD.py          #   Real-probe re-train without saving (visualize-only)
+│   │   ├── MBD_gaussian.py       #   No-MLP variant (synthetic)
+│   │   ├── MBD_gaussian_MLP.py   #   Non-hierarchical variant (synthetic)
+│   │   └── gaussian_MLP.py       #   No-MBD variant (synthetic)
+│   └── legacy/                   # Earlier exploratory scripts (synthetic only)
 └── output/                       # Saved figures from prior runs
 ```
 
@@ -94,21 +111,21 @@ Contains all learnable parameters (FP16 quantized storage), supporting real-time
 
 ## Usage
 
+Scripts use paths relative to `__file__`, so any working directory works.
+
 ### 1. Training (Offline Compression)
 
-```powershell
-cd HI-NE-GBD/buildtime
-python HI-NE-GBD.py
+```bash
+python HI-NE-GBD/buildtime/HI-NE-GBD.py
 ```
 
-After training completes, the compressed model is automatically saved to `runtime/compressed_model.pth`.
+Trains for 3500 epochs (500 coarse + 2500 joint + 500 fine) on `HI-NE-GBD/probedata/ILCSampleData_0.bin` and writes `HI-NE-GBD/runtime/compressed_model.pth` (FP16-quantized).
 
 ### 2. Real-time Decompression (Python)
 
 ```python
 from decoder import HINEGBDDecoder
 
-# Load model
 decoder = HINEGBDDecoder("compressed_model.pth")
 
 # Single point query (world coordinates)
@@ -120,17 +137,30 @@ coords = np.array([[100, 50, -200], [110, 60, -180]], dtype=np.float32)
 sh_batch = decoder.decode_batch(coords)
 ```
 
-### 3. Interactive Command-Line Mode
+### 3. Interactive / Benchmark / Single-point CLI
 
-```powershell
-cd HI-NE-GBD/runtime
-python decoder.py --model compressed_model.pth --interactive
+```bash
+python HI-NE-GBD/runtime/decoder.py --interactive
+python HI-NE-GBD/runtime/decoder.py --benchmark
+python HI-NE-GBD/runtime/decoder.py --coords 100 50 -200            # world coords
+python HI-NE-GBD/runtime/decoder.py --coords 0.5 0.5 0.5 --normalized
 ```
 
-### 4. Performance Benchmark
+`--device {cpu,cuda}` overrides auto-detection; `--model PATH` overrides the default `compressed_model.pth`.
 
-```powershell
-python decoder.py --model compressed_model.pth --benchmark
+### 4. Export to C++ Runtime
+
+```bash
+python HI-NE-GBD/runtime/export_model.py \
+  --model compressed_model.pth --output hinegbd_model.uasset --verify
+```
+
+Then build the C++ demo (Windows / MSVC):
+
+```bash
+cmake -S HI-NE-GBD/runtime/cpp -B HI-NE-GBD/runtime/cpp/build
+cmake --build HI-NE-GBD/runtime/cpp/build --config Release
+HI-NE-GBD/runtime/cpp/build/bin/HINEGBD_Demo.exe hinegbd_model.uasset
 ```
 
 ## Model Configuration (Default Parameters)

@@ -81,7 +81,8 @@ def load_ilc_probe_data(bin_path):
     return positions_normalized, sh_coeffs, radii, shadows, pos_min, pos_max
 
 # ===== 加载探针数据 =====
-BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ILCSampleData_0.bin')
+BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '..', '..', 'HI-NE-GBD', 'probedata', 'ILCSampleData_0.bin')
 positions_np, sh_coeffs_np, radii_np, shadows_np, pos_min, pos_max = load_ilc_probe_data(BIN_PATH)
 
 # 转为PyTorch张量
