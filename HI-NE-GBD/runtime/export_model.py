@@ -16,6 +16,7 @@ HI-NE-GBD 模型导出工具
         data_dim, num_bases, coeff_res, basis_res, fine_gaussian_res: uint32 x5
         pe_num_freqs, mlp_hidden, fine_mlp_depth: uint32 x3
         num_fine_mlp_linear_layers, num_residual_linear_layers: uint32 x2
+        use_fp16: uint32, latent_dim: uint32
         pos_min[3], pos_max[3]: float32 x6
     [Weight Tensors - sequential]
         每个 tensor: uint64(元素数量) + float32[N](数据)
@@ -68,10 +69,11 @@ def export_model(model_path, output_path):
     pe_num_freqs = config['pe_num_freqs']
     mlp_hidden = config['mlp_hidden']
     fine_mlp_depth = config['fine_mlp_depth']
-    
+    latent_dim = config.get('latent_dim', 32)  # paper-aligned fine MLP latent width K
+
     # 计算 fine_mlp 的层数信息
     pe_dim = 3 * (1 + 2 * pe_num_freqs)  # positional encoding output dim
-    fine_input_dim = pe_dim + fine_gaussian_res
+    fine_input_dim = pe_dim + latent_dim
     
     # 收集 MLP 层的 weight/bias keys (只取 Linear 层)
     fine_mlp_keys = []
@@ -99,7 +101,7 @@ def export_model(model_path, output_path):
     print(f"[Export] 模型配置:")
     print(f"  data_dim={data_dim}, num_bases(L)={num_bases}")
     print(f"  coeff_res(M)={coeff_res}, basis_res(N)={basis_res}, fine_gaussian_res(F)={fine_gaussian_res}")
-    print(f"  pe_num_freqs={pe_num_freqs}, mlp_hidden={mlp_hidden}, fine_mlp_depth={fine_mlp_depth}")
+    print(f"  pe_num_freqs={pe_num_freqs}, mlp_hidden={mlp_hidden}, fine_mlp_depth={fine_mlp_depth}, latent_dim(K)={latent_dim}")
     print(f"  pe_dim={pe_dim}, fine_input_dim={fine_input_dim}")
     print(f"  pos_min={pos_min}, pos_max={pos_max}")
     print(f"  Fine MLP Linear layers ({num_fine_mlp_linear_layers}): {fine_mlp_keys}")
@@ -127,7 +129,8 @@ def export_model(model_path, output_path):
         f.write(struct.pack('<I', num_fine_mlp_linear_layers))
         f.write(struct.pack('<I', num_residual_linear_layers))
         f.write(struct.pack('<I', 1 if use_fp16 else 0))  # UseFP16 flag
-        
+        f.write(struct.pack('<I', latent_dim))            # K — paper Eq.5/7 latent width
+
         # Position normalization params
         f.write(pos_min.tobytes())  # float32 x 3 = 12 bytes
         f.write(pos_max.tobytes())  # float32 x 3 = 12 bytes
@@ -147,7 +150,7 @@ def export_model(model_path, output_path):
         write_tensor(f, state_dict['fine_log_s'], use_fp16)       # [F, 3]
         write_tensor(f, state_dict['fine_q'], use_fp16)           # [F, 4]
         write_tensor(f, state_dict['fine_alpha'], use_fp16)       # [F]
-        write_tensor(f, state_dict['fine_features'], use_fp16)    # [F, D]
+        write_tensor(f, state_dict['fine_features'], use_fp16)    # [F, K] — paper Eq.5 latent V
         
         # MBD Tensors
         write_tensor(f, state_dict['C'], use_fp16)                # [M, L]
@@ -205,11 +208,12 @@ def verify_export(output_path):
         num_fine_mlp_layers = struct.unpack('<I', f.read(4))[0]
         num_residual_layers = struct.unpack('<I', f.read(4))[0]
         use_fp16 = struct.unpack('<I', f.read(4))[0]
-        
+        latent_dim = struct.unpack('<I', f.read(4))[0]
+
         pos_min = np.frombuffer(f.read(12), dtype=np.float32)
         pos_max = np.frombuffer(f.read(12), dtype=np.float32)
-        
-        print(f"  Config: data_dim={data_dim}, L={num_bases}, M={coeff_res}, N={basis_res}, F={fine_gaussian_res}")
+
+        print(f"  Config: data_dim={data_dim}, L={num_bases}, M={coeff_res}, N={basis_res}, F={fine_gaussian_res}, K={latent_dim}")
         print(f"  PE freqs={pe_num_freqs}, MLP hidden={mlp_hidden}, depth={fine_mlp_depth}")
         print(f"  Fine MLP layers: {num_fine_mlp_layers}, Residual layers: {num_residual_layers}")
         print(f"  UseFP16: {use_fp16}")

@@ -76,13 +76,15 @@ class MBDCompressor3D(nn.Module):
 
     def __init__(self, num_bases=6, coeff_res=12, basis_res=8, data_dim=3,
                  coeff_kernel_scale=0.15, basis_kernel_scale=0.2, mlp_hidden=64,
-                 pe_num_freqs=4, fine_mlp_depth=2, fine_gaussian_res=16, fine_kernel_scale=0.08):
+                 pe_num_freqs=4, fine_mlp_depth=2, fine_gaussian_res=16, fine_kernel_scale=0.08,
+                 latent_dim=32):
         super().__init__()
         self.L = num_bases
         self.data_dim = data_dim
         self.mlp_hidden = mlp_hidden
         self.pe_num_freqs = pe_num_freqs
         self.fine_gaussian_res = fine_gaussian_res
+        self.latent_dim = latent_dim
 
         # Coefficient 3D Gaussian Parameters
         self.coeff_mu = nn.Parameter(torch.rand(coeff_res, 3))
@@ -101,7 +103,8 @@ class MBDCompressor3D(nn.Module):
         self.fine_log_s = nn.Parameter(torch.ones(fine_gaussian_res, 3) * np.log(fine_kernel_scale))
         self.fine_q = nn.Parameter(torch.zeros(fine_gaussian_res, 4))
         self.fine_alpha = nn.Parameter(torch.zeros(fine_gaussian_res))
-        self.fine_features = nn.Parameter(torch.randn(fine_gaussian_res, data_dim) * 0.01)
+        # Per-anchor latent V: [F, K] (paper Eq.5)
+        self.fine_features = nn.Parameter(torch.randn(fine_gaussian_res, latent_dim) * (1.0 / np.sqrt(latent_dim)))
 
         # MBD Coefficient/Basis Tensors
         self.C = nn.Parameter(torch.randn(coeff_res, self.L) * 0.1)
@@ -112,8 +115,8 @@ class MBDCompressor3D(nn.Module):
         self.pos_encoder = PositionalEncoding(num_freqs=pe_num_freqs)
         pe_dim = self.pos_encoder.get_output_dim(3)
 
-        # Fine Branch MLP
-        fine_input_dim = pe_dim + fine_gaussian_res
+        # Fine Branch MLP — input: PE(x) + mixed latent F(x) [K]
+        fine_input_dim = pe_dim + latent_dim
         fine_layers = []
         fine_layers.append(nn.Linear(fine_input_dim, mlp_hidden))
         fine_layers.append(nn.ReLU())
@@ -183,15 +186,14 @@ class MBDCompressor3D(nn.Module):
         scaled_coeff = moving_coeff * mbd_scale.unsqueeze(0)
         coarse_output = torch.sum(scaled_coeff.unsqueeze(-1) * moving_basis, dim=1)
 
-        # Fine Branch: Gaussian-Guided MLP
+        # Fine Branch: paper-aligned mixed-latent MLP (GPC Eq.5/7)
         fine_weights = self.compute_gaussian_weights_3d(
             coords, self.fine_mu, self.fine_log_s, self.fine_q, self.fine_alpha
-        )
-        coords_encoded = self.pos_encoder(coords)
-        fine_input = torch.cat([coords_encoded, fine_weights], dim=-1)
-        fine_mlp_output = self.fine_mlp(fine_input)
-        fine_gaussian_interp = torch.matmul(fine_weights, self.fine_features)
-        fine_output = fine_mlp_output + 0.2 * fine_gaussian_interp
+        )                                                              # [Q, F]
+        mixed_latent = torch.matmul(fine_weights, self.fine_features)  # [Q, K]   Eq.5
+        coords_encoded = self.pos_encoder(coords)                      # [Q, pe_dim]
+        fine_input = torch.cat([coords_encoded, mixed_latent], dim=-1) # [Q, pe_dim + K]
+        fine_output = self.fine_mlp(fine_input)                        # [Q, D]   Eq.7
 
         # Additive Blending
         blended = coarse_output + fine_output

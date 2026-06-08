@@ -84,12 +84,14 @@ namespace HINEGBD
         uint32_t NumFineMLPLayers = 0;   // Fine MLP 线性层数量
         uint32_t NumResidualLayers = 0;  // Residual 线性层数量
         uint32_t UseFP16 = 0;              // 是否使用 FP16 存储权重
+        uint32_t LatentDim = 32;           // K: per-anchor latent width V_{[F,K]} (paper Eq.5/7)
 
         float PosMin[3] = {0, 0, 0};    // 世界坐标最小值
         float PosMax[3] = {1, 1, 1};    // 世界坐标最大值
 
         uint32_t GetPEDim() const { return 3 * (1 + 2 * PENumFreqs); }
-        uint32_t GetFineInputDim() const { return GetPEDim() + FineGaussianRes; }
+        // Paper-aligned fine MLP input: PE(x) ⊕ mixed latent F(x) ∈ R^K
+        uint32_t GetFineInputDim() const { return GetPEDim() + LatentDim; }
     };
 
     // ======================== 模型主类 ========================

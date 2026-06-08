@@ -195,6 +195,7 @@ void FHINEGBDModel::Serialize(UCommon::IArchive& Archive)
     Archive.ByteSerialize(Config.NumFineMLPLayers);
     Archive.ByteSerialize(Config.NumResidualLayers);
     Archive.ByteSerialize(Config.UseFP16);
+    Archive.ByteSerialize(Config.LatentDim);
 
     // Position normalization
     Archive.Serialize(Config.PosMin, 3 * sizeof(float));
@@ -455,41 +456,36 @@ void FHINEGBDModel::Forward(const float* NormCoords, float* Output, uint32_t Q) 
         }
     }
 
-    // ==================== 细分支 (Fine Branch) ====================
+    // ==================== 细分支 (Fine Branch, paper-aligned Eq.5/7) ====================
 
-    // 计算细高斯权重: fine_weights [Q, F]
+    const uint32_t K = Config.LatentDim;
+
+    // 计算细高斯权重 φ_fine: [Q, F]
     std::vector<float> FineWeights(Q * F);
     ComputeGaussianWeights(NormCoords, Q, FineGaussian, FineWeights.data());
+
+    // 混合 per-anchor latent: F(x) = φ_fine(x) · V_{[F,K]} -> [Q, K]   (Eq.5)
+    std::vector<float> MixedLatent(Q * K);
+    MatMul(FineWeights.data(), FineFeatures.data(), MixedLatent.data(), Q, F, K);
 
     // 位置编码: [Q, PEDim]
     std::vector<float> PEOutput(Q * PEDim);
     PositionalEncoding(NormCoords, PEOutput.data(), Q);
 
-    // Fine MLP 输入: concat(PE [Q, PEDim], FineWeights [Q, F]) -> [Q, PEDim + F]
-    uint32_t FineInputDim = PEDim + F;
+    // Fine MLP 输入: concat(PE [Q, PEDim], MixedLatent [Q, K]) -> [Q, PEDim + K]
+    const uint32_t FineInputDim = PEDim + K;
     std::vector<float> FineInput(Q * FineInputDim);
     for (uint32_t q = 0; q < Q; ++q)
     {
-        std::memcpy(FineInput.data() + q * FineInputDim, 
+        std::memcpy(FineInput.data() + q * FineInputDim,
                     PEOutput.data() + q * PEDim, PEDim * sizeof(float));
-        std::memcpy(FineInput.data() + q * FineInputDim + PEDim, 
-                    FineWeights.data() + q * F, F * sizeof(float));
+        std::memcpy(FineInput.data() + q * FineInputDim + PEDim,
+                    MixedLatent.data() + q * K, K * sizeof(float));
     }
 
-    // Fine MLP forward: [Q, FineInputDim] -> [Q, D]
-    std::vector<float> FineMlpOutput(Q * D);
-    FineMLP.ForwardBatch(FineInput.data(), FineMlpOutput.data(), Q);
-
-    // fine_gaussian_interp = fine_weights [Q, F] * fine_features [F, D] -> [Q, D]
-    std::vector<float> FineGaussianInterp(Q * D);
-    MatMul(FineWeights.data(), FineFeatures.data(), FineGaussianInterp.data(), Q, F, D);
-
-    // fine_output = fine_mlp_output + 0.2 * fine_gaussian_interp
+    // Fine MLP forward: [Q, FineInputDim] -> [Q, D]   (Eq.7)
     std::vector<float> FineOutput(Q * D);
-    for (uint32_t i = 0; i < Q * D; ++i)
-    {
-        FineOutput[i] = FineMlpOutput[i] + 0.2f * FineGaussianInterp[i];
-    }
+    FineMLP.ForwardBatch(FineInput.data(), FineOutput.data(), Q);
 
     // ==================== 混合 + 残差 ====================
 

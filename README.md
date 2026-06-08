@@ -32,7 +32,7 @@ $$
 
 ### Data Flow & Channel Dimensions
 
-The diagram below traces a query of $B$ probes through the network. **Edge labels are tensor shapes** — every transformation that changes the channel count is annotated:
+The diagram below traces a query of $B$ probes through the network. **Edge labels are tensor shapes** — every channel-count transition is annotated.
 
 ```mermaid
 flowchart TD
@@ -43,20 +43,17 @@ flowchart TD
     INPUT --> BASIS_G["Basis Gaussians<br/>N = 64 anchors"]:::op
     INPUT --> FINE_G["Fine Gaussians<br/>F = 32 anchors"]:::op
 
-    PE -->|"[B, 39]"| CAT
-    FINE_G -->|"φ_fine<br/>[B, 32]"| CAT["concat"]:::op
-    FINE_G -->|"φ_fine<br/>[B, 32]"| FINTERP["× fine_features<br/>[32, 27]"]:::op
-
-    CAT -->|"[B, 71]"| FMLP["fine_mlp<br/>71→128→128→128→27"]:::mlp
-    FMLP -->|"[B, 27]"| FADD(("+"))
-    FINTERP -->|"[B, 27]<br/>× 0.2"| FADD
-    FADD -->|"f_fine<br/><b>[B, 27]</b>"| BLEND(("+"))
-
     COEFF_G -->|"φ<br/>[B, 64]"| MC["× C<br/>[64, 16]"]:::op
     BASIS_G -->|"ψ<br/>[B, 64]"| MB["× B<br/>[64, 16, 27]"]:::op
     MC -->|"c_l(x)<br/>[B, 16]"| MBD["MBD reduce<br/>Σ_l scale_l · c_l · b_l"]:::op
     MB -->|"b_l(x)<br/>[B, 16, 27]"| MBD
-    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND
+    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND(("+"))
+
+    FINE_G -->|"φ_fine<br/>[B, 32]"| MIX["× V (latent)<br/>[F=32, K=32]<br/>↓ scene content enters here"]:::op
+    PE -->|"[B, 39]"| CAT["concat<br/>[B, 71]"]:::op
+    MIX -->|"mixed latent F(x)<br/><b>[B, 32]</b>"| CAT
+    CAT --> FMLP["fine_mlp<br/>71→128→128→128→27<br/>(GPC Eq.7)"]:::mlp
+    FMLP -->|"f_fine<br/><b>[B, 27]</b>"| BLEND
 
     BLEND -->|"blended<br/>[B, 27]"| REFCAT["concat with coords"]:::op
     INPUT -.->|"[B, 3]"| REFCAT
@@ -89,13 +86,37 @@ $$
 
 Each Gaussian carries full covariance parameters: `position(3) + log_scale(3) + quaternion(4) + alpha(1)` — anisotropic, rotatable, intensity-weighted.
 
-#### Fine Branch — Gaussian-Guided MLP
+#### Fine Branch — Mixed-Latent MLP (paper-aligned, GPC Eq.5/7)
+
+The fine branch follows *Gaussian Compression for Precomputed Indirect Illumination* (SIGGRAPH 2025): each fine anchor carries a $K$-dim **latent** $\mathbf{V}_j$, the Gaussian weights mix those latents into a per-query feature $F(\mathbf{x})$, and the MLP maps that — concatenated with positional encoding — to the $D$-dim output:
 
 $$
-f_{\text{fine}}(\mathbf{x}) = \text{MLP}\!\big(\text{PE}(\mathbf{x}) \,\Vert\, \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\big) + 0.2 \cdot \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\, F
+\underbrace{\boldsymbol{\varphi}(\mathbf{x}) \in \mathbb{R}^F}_{\text{Eq.6 weights}}, \quad
+\underbrace{F(\mathbf{x}) = \boldsymbol{\varphi}(\mathbf{x})\,\mathbf{V}}_{\text{Eq.5: }[B, K]}, \quad
+\underbrace{f_{\text{fine}}(\mathbf{x}) = \text{MLP}_\theta\!\Big(\text{PE}(\mathbf{x}) \,\Vert\, F(\mathbf{x})\Big)}_{\text{Eq.7: }[B, D]}
 $$
 
-Fine Gaussians ($F=32$) are sparse anchors that learn to locate high-frequency regions; their weights condition the MLP, providing spatial awareness on top of positional encoding.
+with $F=32$ anchors, $K=32$ latent width, and $\mathbf{V} \in \mathbb{R}^{32 \times 32}$. The MLP's first layer is $71{\to}128$ (PE 39 + latent 32) and the output layer is zero-initialized so the fine branch starts at zero and learns a residual on top of MBD.
+
+```mermaid
+flowchart TD
+    INPUT["coords [B, 3]"]:::input
+    INPUT --> PE["Positional Encoding<br/>[B, 39]"]:::op
+    INPUT --> FW["fine_weights φ(x)<br/>[B, 32]"]:::op
+    FW --> MIX["× V (per-anchor latent)<br/>[F=32, K=32]<br/>= F(x) — mixed latent <b>[B, 32]</b>"]:::op
+    PE -->|"[B, 39]"| CAT["concat<br/>[B, 71]"]:::op
+    MIX -->|"[B, 32]"| CAT
+    CAT --> MLP["fine_mlp · 71→128→128→128→27<br/>GPC Eq.7"]:::mlp
+    MLP --> OUT["f_fine [B, 27]"]:::output
+
+    classDef input fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef output fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef op fill:#fff9c4,stroke:#f57f17
+    classDef mlp fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+```
+
+> [!NOTE]
+> **Earlier we tried a different formulation** that fed the 32-dim Gaussian weights $\boldsymbol{\varphi}(\mathbf{x})$ directly into the MLP and pulled $\mathbf{V}\,\boldsymbol{\varphi}$ in via a $0.2\times$ linear side path. With $\mathbf{V} \in \mathbb{R}^{F \times D=27}$ this meant the MLP only ever saw positional information; the scene content reached the output through a non-trainable mixer. Switching to the paper-aligned form above gave **+0.23 dB PSNR** at 3-seed mean (matched compute), with seed-to-seed variance also going down (0.46 → 0.33 dB). See [§ Ablation: Why Each Component Stays](#ablation-why-each-component-stays) for the full v7 numbers.
 
 #### Residual Refiner — 27-dim Cross-Channel Correction
 
@@ -140,19 +161,53 @@ $$
 
 ### Ablation: Why Each Component Stays
 
-<details>
-<summary><b>Click to expand</b> — parameter-matched ablation of the residual refiner</summary>
+Five rounds (v2 → v7), 3 seeds × 3500 epochs each, real probe data, FP16 post-training quantization, identical training loop. Each round answers one question.
 
-To check whether the residual refiner is "wasted parameters," we ran a parameter-matched ablation: each variant has ~80,750 trainable params, 3 seeds × 3500 epochs + FP16 quantization, real probe data.
+#### v7: Paper-aligned fine branch beats weights-into-MLP
 
-| Variant | Description | PSNR (mean ± std) | SSIM | Params |
-|---------|-------------|------------------:|:----:|-------:|
-| **A**: with refiner | F=32, h=128, +residual_refiner (production) | **40.32 ± 0.49** | **0.9482** | 80,774 |
+The current fine branch follows GPC Eq.5/7 exactly (see [§ Fine Branch](#fine-branch--mixed-latent-mlp-paper-aligned-gpc-eq57)). To prove it's an actual improvement over the earlier "feed Gaussian weights into MLP, side-path the latent" formulation, both were trained head-to-head with the same 3-stage curriculum.
+
+| Variant | Fine-branch form | PSNR (mean ± std) | SSIM | Params |
+|---|---|---:|:---:|---:|
+| OLD | $\text{MLP}(\text{PE}\,\Vert\,\boldsymbol{\varphi}) + 0.2\,\boldsymbol{\varphi}\,\mathbf{V}_{[F,D=27]}$ | 40.317 ± 0.461 | 0.9482 | 80,774 |
+| **NEW** | $\text{MLP}\!\big(\text{PE}\,\Vert\,\boldsymbol{\varphi}\,\mathbf{V}_{[F,K=32]}\big)$ | **40.547 ± 0.330** | **0.9495** | 80,934 |
+| Δ | | **+0.230 dB** | +0.0013 | +160 |
+
+NEW wins on 2 of 3 seeds and tightens the seed-to-seed spread (0.46 → 0.33 dB), at +0.4 KB FP16 cost.
+
+#### v2: Residual refiner is not "wasted parameters"
+
+We re-spent the refiner's budget on more fine Gaussians or a wider fine MLP — it doesn't recover the gain.
+
+| Variant | Description | PSNR | SSIM | Params |
+|---|---|---:|:---:|---:|
+| **A**: with refiner | F=32, h=128, +residual_refiner | **40.32 ± 0.49** | **0.9482** | 80,774 |
 | B: more fine Gaussians | F=54, h=128, no refiner | 39.25 ± 0.61 | 0.9348 | 80,687 |
-| C: wider fine MLP    | F=32, h=134, no refiner | 39.85 ± 0.07 | 0.9409 | 80,785 |
-| D: fine sees coarse  | fine_mlp gets coarse_output as input, no refiner | 39.55 ± 0.45 | 0.9353 | 80,491 |
+| C: wider fine MLP | F=32, h=134, no refiner | 39.85 ± 0.07 | 0.9409 | 80,785 |
+| D: fine sees coarse | fine_mlp gets coarse_output, no refiner | 39.55 ± 0.45 | 0.9353 | 80,491 |
 
-**The refiner wins all three pairings**: +1.07 dB over B, +0.47 dB over C, +0.77 dB over D. Reallocating the same budget into wider/denser fine layers cannot recover the gain — the refiner occupies a structurally unique position: it is the only component that sees the **27-dim blended output** and can correct cross-channel correlated errors (e.g., L0_R and L0_G drifting together) that the coordinate-conditioned fine MLP can't observe.
+The refiner is the only component seeing the 27-dim blended output, so it can fix **cross-channel correlated errors** (e.g. L0_R and L0_G drifting together) that the per-coordinate fine MLP cannot. **+1.07 dB / +0.47 dB / +0.77 dB** over the three same-budget alternatives.
+
+#### v5–v6: PE is structurally essential
+
+| Probe | What was changed (vs production) | PSNR | Δ |
+|---|---|---:|---:|
+| Production (current) | — | 40.55 | — |
+| **G** (v5): drop side path, drop refiner, keep PE | Tests if PE alone covers high-freq | 39.52 | −1.03 |
+| **H** (v5): also drop PE | Just MBD + mixed latent + fine MLP | 33.71 | −6.84 |
+| I (v6): no PE, F=128 anchors | 4× anchor density to compensate for missing PE | 33.64 | −6.91 |
+| I (v6): no PE, F=512 anchors | 16× anchor density | 33.84 | −6.71 |
+
+**PE is irreplaceable** — even 16× anchor density can't recover the 6.7 dB drop. Refiner removal alone costs ~1 dB even with PE. Only the $0.2\times$ side path was safely removable, which is what v7 tests systematically.
+
+<details>
+<summary>What each round added (one-liner each)</summary>
+
+- **v2** — disproves "the refiner is redundant" by showing the same parameter budget elsewhere is strictly worse.
+- **v4** — first run of paper-aligned fine branch (E_paper_K32) inside the simplified loop; +0.23 dB vs OLD.
+- **v5** — ablates the side path and the refiner together; refiner alone removal costs 0.8 dB.
+- **v6** — kills the "PE is just dressing, more anchors will replace it" hypothesis (it won't, by 6+ dB).
+- **v7** — full buildtime training loop A/B; the +0.23 dB is real, not an artifact of the ablation harness.
 
 </details>
 

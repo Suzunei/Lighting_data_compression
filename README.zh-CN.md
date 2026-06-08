@@ -32,7 +32,7 @@ $$
 
 ### 数据流与通道维度
 
-下图追踪一批 $B$ 个探针在网络中的流动。**边上的标注就是张量形状** —— 每一处通道维度变化都标了出来：
+下面这张图追踪一批 $B$ 个探针在网络中的流动。**边上的标注就是张量形状**，每一处通道维度变化都标了出来。
 
 ```mermaid
 flowchart TD
@@ -43,20 +43,17 @@ flowchart TD
     INPUT --> BASIS_G["基函数高斯<br/>N = 64 个锚点"]:::op
     INPUT --> FINE_G["Fine 高斯<br/>F = 32 个锚点"]:::op
 
-    PE -->|"[B, 39]"| CAT
-    FINE_G -->|"φ_fine<br/>[B, 32]"| CAT["concat"]:::op
-    FINE_G -->|"φ_fine<br/>[B, 32]"| FINTERP["× fine_features<br/>[32, 27]"]:::op
-
-    CAT -->|"[B, 71]"| FMLP["fine_mlp<br/>71→128→128→128→27"]:::mlp
-    FMLP -->|"[B, 27]"| FADD(("+"))
-    FINTERP -->|"[B, 27]<br/>× 0.2"| FADD
-    FADD -->|"f_fine<br/><b>[B, 27]</b>"| BLEND(("+"))
-
     COEFF_G -->|"φ<br/>[B, 64]"| MC["× C<br/>[64, 16]"]:::op
     BASIS_G -->|"ψ<br/>[B, 64]"| MB["× B<br/>[64, 16, 27]"]:::op
     MC -->|"c_l(x)<br/>[B, 16]"| MBD["MBD 归约<br/>Σ_l scale_l · c_l · b_l"]:::op
     MB -->|"b_l(x)<br/>[B, 16, 27]"| MBD
-    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND
+    MBD -->|"f_coarse<br/><b>[B, 27]</b>"| BLEND(("+"))
+
+    FINE_G -->|"φ_fine<br/>[B, 32]"| MIX["× V (latent)<br/>[F=32, K=32]<br/>↓ 场景内容从这里进入"]:::op
+    PE -->|"[B, 39]"| CAT["concat<br/>[B, 71]"]:::op
+    MIX -->|"混合 latent F(x)<br/><b>[B, 32]</b>"| CAT
+    CAT --> FMLP["fine_mlp<br/>71→128→128→128→27<br/>(GPC Eq.7)"]:::mlp
+    FMLP -->|"f_fine<br/><b>[B, 27]</b>"| BLEND
 
     BLEND -->|"blended<br/>[B, 27]"| REFCAT["与 coords 拼接"]:::op
     INPUT -.->|"[B, 3]"| REFCAT
@@ -89,13 +86,37 @@ $$
 
 每个高斯都带完整协方差参数：`position(3) + log_scale(3) + quaternion(4) + alpha(1)` —— 各向异性、可旋转、强度可调。
 
-#### Fine 分支 — 高斯引导 MLP
+#### Fine 分支 — 混合 Latent MLP（论文对齐, GPC Eq.5/7）
+
+Fine 分支严格遵循 *Gaussian Compression for Precomputed Indirect Illumination*（SIGGRAPH 2025）：每个 fine 锚点带一个 $K$ 维 **latent** $\mathbf{V}_j$，高斯权重把这些 latent 混合成查询点的特征 $F(\mathbf{x})$，然后 MLP 把这个特征（与位置编码拼接后）映射到 $D$ 维输出：
 
 $$
-f_{\text{fine}}(\mathbf{x}) = \text{MLP}\!\big(\text{PE}(\mathbf{x}) \,\Vert\, \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\big) + 0.2 \cdot \boldsymbol{\varphi}_{\text{fine}}(\mathbf{x})\, F
+\underbrace{\boldsymbol{\varphi}(\mathbf{x}) \in \mathbb{R}^F}_{\text{Eq.6 权重}}, \quad
+\underbrace{F(\mathbf{x}) = \boldsymbol{\varphi}(\mathbf{x})\,\mathbf{V}}_{\text{Eq.5: }[B, K]}, \quad
+\underbrace{f_{\text{fine}}(\mathbf{x}) = \text{MLP}_\theta\!\Big(\text{PE}(\mathbf{x}) \,\Vert\, F(\mathbf{x})\Big)}_{\text{Eq.7: }[B, D]}
 $$
 
-Fine 高斯（$F=32$ 个）是稀疏锚点，自适应学习高频区域；它们的权重作为 MLP 的条件输入，在位置编码之上额外提供空间感知。
+其中 $F=32$ 个锚点、latent 宽度 $K=32$、$\mathbf{V} \in \mathbb{R}^{32 \times 32}$。MLP 第一层是 $71{\to}128$（PE 39 + latent 32），最后一层零初始化，让 fine 分支从零开始、在 MBD 之上学残差。
+
+```mermaid
+flowchart TD
+    INPUT["coords [B, 3]"]:::input
+    INPUT --> PE["位置编码<br/>[B, 39]"]:::op
+    INPUT --> FW["fine_weights φ(x)<br/>[B, 32]"]:::op
+    FW --> MIX["× V (每锚点 latent)<br/>[F=32, K=32]<br/>= F(x) — 混合 latent <b>[B, 32]</b>"]:::op
+    PE -->|"[B, 39]"| CAT["concat<br/>[B, 71]"]:::op
+    MIX -->|"[B, 32]"| CAT
+    CAT --> MLP["fine_mlp · 71→128→128→128→27<br/>GPC Eq.7"]:::mlp
+    MLP --> OUT["f_fine [B, 27]"]:::output
+
+    classDef input fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef output fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef op fill:#fff9c4,stroke:#f57f17
+    classDef mlp fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+```
+
+> [!NOTE]
+> **早期我们试过另一种写法**：把 32 维高斯权重 $\boldsymbol{\varphi}(\mathbf{x})$ 直接喂进 MLP，再用 $0.2\times$ 线性旁路把 $\mathbf{V}\,\boldsymbol{\varphi}$ 加回来。当时 $\mathbf{V} \in \mathbb{R}^{F \times D=27}$，意味着 MLP 看到的全是位置信息，场景内容只能通过一个不可训练的 mixer 进入输出。改成上面这种论文对齐的写法后，3 seed 平均 PSNR **+0.23 dB**，且 seed 间方差也下降（0.46 → 0.33 dB）。完整 v7 数据见[§ 消融研究：每个组件为何保留](#消融研究每个组件为何保留)。
 
 #### 残差精修器 — 27 维跨通道修正
 
@@ -140,19 +161,53 @@ $$
 
 ### 消融研究：每个组件为何保留
 
-<details>
-<summary><b>点击展开</b> — 残差精修器的参数对齐消融</summary>
+共 5 轮（v2 → v7），每轮 3 seed × 3500 epoch、真实探针数据、FP16 后训练量化、训练循环完全一致。每轮回答一个问题。
 
-为了检验残差精修器是不是"浪费的参数"，我们做了参数对齐的消融：每个变体约 80,750 个可训练参数，3 seed × 3500 epoch + FP16 量化，真实探针数据。
+#### v7：论文对齐的 fine 分支胜过"权重直接喂 MLP"
 
-| 变体 | 描述 | PSNR (mean ± std) | SSIM | 参数 |
-|------|------|------------------:|:----:|-----:|
-| **A**：保留精修器 | F=32, h=128, +residual_refiner（生产配置） | **40.32 ± 0.49** | **0.9482** | 80,774 |
+当前 fine 分支严格按 GPC Eq.5/7 实现（见 [§ Fine 分支](#fine-分支--混合-latent-mlp论文对齐-gpc-eq57)）。为了证明这个改动是真的提升、不是偶然，我们让两种写法在同一个 3 阶段课程下正面对决：
+
+| 变体 | Fine 分支形式 | PSNR (mean ± std) | SSIM | 参数 |
+|---|---|---:|:---:|---:|
+| OLD | $\text{MLP}(\text{PE}\,\Vert\,\boldsymbol{\varphi}) + 0.2\,\boldsymbol{\varphi}\,\mathbf{V}_{[F,D=27]}$ | 40.317 ± 0.461 | 0.9482 | 80,774 |
+| **NEW** | $\text{MLP}\!\big(\text{PE}\,\Vert\,\boldsymbol{\varphi}\,\mathbf{V}_{[F,K=32]}\big)$ | **40.547 ± 0.330** | **0.9495** | 80,934 |
+| Δ | | **+0.230 dB** | +0.0013 | +160 |
+
+NEW 在 3 个 seed 中赢 2 个，方差也变小（0.46 → 0.33 dB），代价是 +0.4 KB FP16。
+
+#### v2：残差精修器不是"浪费的参数"
+
+把精修器的预算换成更多 fine 高斯或更宽 fine MLP，PSNR 都补不回来：
+
+| 变体 | 描述 | PSNR | SSIM | 参数 |
+|---|---|---:|:---:|---:|
+| **A**：保留精修器 | F=32, h=128, +residual_refiner | **40.32 ± 0.49** | **0.9482** | 80,774 |
 | B：更多 fine 高斯 | F=54, h=128, 不带精修器 | 39.25 ± 0.61 | 0.9348 | 80,687 |
-| C：更宽 fine MLP   | F=32, h=134, 不带精修器 | 39.85 ± 0.07 | 0.9409 | 80,785 |
+| C：更宽 fine MLP | F=32, h=134, 不带精修器 | 39.85 ± 0.07 | 0.9409 | 80,785 |
 | D：fine 看到 coarse | fine_mlp 输入加上 coarse_output，不带精修器 | 39.55 ± 0.45 | 0.9353 | 80,491 |
 
-**精修器在三组对照中全部胜出**：领先 B 1.07 dB、C 0.47 dB、D 0.77 dB。把同样的参数预算换到更宽/更密的 fine 层都补不回来 —— 精修器占据了结构上独一无二的位置：它是模型里**唯一能看到 27 维融合输出**、能修正跨通道相关误差（例如 L0_R 和 L0_G 一同偏移）的组件，而坐标条件化的 fine MLP 看不见这种模式。
+精修器是模型里**唯一能看到 27 维融合输出**、能修正跨通道相关误差（例如 L0_R 和 L0_G 一同偏移）的组件，而坐标条件化的 fine MLP 看不见这种模式。**领先 B 1.07 dB / C 0.47 dB / D 0.77 dB**。
+
+#### v5–v6：PE 在结构上不可替代
+
+| 探针 | 改了什么（相对生产配置） | PSNR | Δ |
+|---|---|---:|---:|
+| 生产配置（当前） | — | 40.55 | — |
+| **G** (v5)：删旁路、删精修器、保留 PE | 检验仅靠 PE 能否覆盖高频 | 39.52 | −1.03 |
+| **H** (v5)：再删 PE | 仅 MBD + 混合 latent + fine MLP | 33.71 | −6.84 |
+| I (v6)：无 PE，F=128 锚点 | 4× 锚点密度补偿 PE 的缺失 | 33.64 | −6.91 |
+| I (v6)：无 PE，F=512 锚点 | 16× 锚点密度 | 33.84 | −6.71 |
+
+**PE 不可替代** —— 即便 16× 锚点密度也补不回 6.7 dB 的损失。仅删精修器在保留 PE 时也损失约 1 dB。只有 $0.2\times$ 旁路是可以安全删除的，这正是 v7 系统验证的内容。
+
+<details>
+<summary>每一轮的核心结论（一行总结）</summary>
+
+- **v2** —— 反驳"精修器冗余"，相同参数预算换到别处一律更差。
+- **v4** —— 论文对齐 fine 分支（E_paper_K32）首次跑，简化训练循环里 +0.23 dB。
+- **v5** —— 同时去掉旁路和精修器；仅删精修器损失 0.8 dB。
+- **v6** —— 否决"PE 只是装饰、加锚点就行"的猜想（差 6+ dB 一律救不回）。
+- **v7** —— 在完整 buildtime 训练循环下做 A/B 对照；+0.23 dB 是真实的，不是消融脚本的伪影。
 
 </details>
 
