@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Trained / exported model artifacts (regenerable from buildtime/HI-NE-GBD.py + export_model.py)
+*.pth
+*.uasset
+
+# C++ build output
+HI-NE-GBD/runtime/cpp/build/
+*.obj
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# Logs / scratch
+*.log
+opt_output.txt
+HI-NE-GBD/runtime/cpp/check_log.txt
+HI-NE-GBD/runtime/cpp/export_log.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

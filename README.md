@@ -68,23 +68,29 @@ Contains all learnable parameters (FP16 quantized storage), supporting real-time
 ## Project Structure
 
 ```
-HI-NE-GBD/
-├── buildtime/
-│   ├── HI-NE-GBD.py          # Main training script (offline compression)
-│   ├── probe_reader.py        # Probe data reader utility
-│   └── HI-NE-GBD.png          # Training results visualization
-├── runtime/
-│   ├── decoder.py             # Real-time decoder module (Python)
-│   ├── export_model.py        # Model export utility
-│   ├── compressed_model.pth   # Compressed model file
-│   └── cpp/                   # C++ runtime implementation
-│       ├── HINEGBD.h/cpp      # C++ decoder
-│       ├── main.cpp           # Test entry point
-│       └── CMakeLists.txt     # Build configuration
-├── probedata/
-│   └── ILCSampleData_0.bin    # Light probe raw data
-└── HI-NE-GBD.png              # Architecture diagram
+.
+├── docs/
+│   └── architecture.png          # Architecture diagram (project doc)
+├── HI-NE-GBD/                    # Production pipeline (use this)
+│   ├── buildtime/
+│   │   ├── HI-NE-GBD.py          #   Main training script (offline compression)
+│   │   └── probe_reader.py       #   Probe data reader utility
+│   ├── runtime/
+│   │   ├── decoder.py            #   Real-time decoder (Python)
+│   │   ├── export_model.py       #   PyTorch -> UCommon .uasset exporter
+│   │   └── cpp/                  #   C++ runtime (MSVC)
+│   │       ├── HINEGBD.h/cpp     #     decoder library
+│   │       ├── main.cpp          #     demo entry point
+│   │       └── CMakeLists.txt
+│   └── probedata/
+│       └── ILCSampleData_0.bin   #   Light probe raw data (only copy)
+├── experiments/                  # Research / ablation scripts (synthetic signals)
+│   ├── ablation/                 #   Component ablations + per-experiment .png
+│   └── legacy/                   #   Earlier exploratory scripts
+└── output/                       # Saved figures from prior runs
 ```
+
+`compressed_model.pth` (training output) and `hinegbd_model.uasset` (exporter output) are not checked in — they are produced by running the buildtime / export scripts.
 
 ## Usage
 
@@ -171,9 +177,11 @@ python decoder.py --model compressed_model.pth --benchmark
 
 ## Ablation Studies
 
-The `src/` directory contains ablation experiment scripts for individual components:
+The `experiments/ablation/` directory contains ablation scripts for individual components (run on synthetic signals from `test_signal_3d.py`, except where noted):
 - `MBD_gaussian.py`: MBD + Gaussian (no MLP)
 - `MBD_gaussian_MLP.py`: MBD + Gaussian + MLP
 - `gaussian_MLP.py`: Gaussian + MLP (no MBD)
-- `HI-NE-ablation.py`: HI-NE-GBD ablation comparison
+- `HI-NE-GBD.py`: hierarchical model run on real probe data (`ILCSampleData_0.bin`)
+
+`experiments/legacy/` keeps earlier exploratory scripts (`opt.py`, `HI_TEST.py`, `MBD_*.py`, `gaussian_control.py`) for historical reference.
 
